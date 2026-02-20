@@ -4,19 +4,17 @@
 
 ### How to Install
 
-1. **Uninstall FElupe** (to avoid conflicts):
-
-```bash
-pip uninstall felupe
-```
-
-2. **Install New Dependencies**:
+1. **Install New Dependencies**:
 Save the text above as `requirements.txt` and run:
 
 ```bash
 pip install -r requirements.txt
 ```
+2. **Run the Main.py**:
 
+```bash
+python3 main,py
+```
 
 ### Why these packages?
 
