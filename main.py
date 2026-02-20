@@ -1,261 +1,261 @@
 import sys
 import numpy as np
-import felupe as fe
+import warnings
+from scipy.sparse import linalg as splinalg
+
+# 경고 메시지 무시
+warnings.filterwarnings("ignore")
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QSlider, QLabel, QGroupBox, QGridLayout)
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.collections import PolyCollection
+
+# Scikit-FEM imports
+from skfem import *
+from skfem.models.elasticity import lame_parameters, linear_elasticity
+from skfem.helpers import dot, grad
 
 # ==============================================================================
-# 1. Physics Engine: O-Ring Simulation Class (FElupe)
+# 1. Physics Engine: Scikit-FEM (Explicit Matrix Solving)
 # ==============================================================================
-class ORingSimulation:
+class SkfemSolver:
     def __init__(self):
-        # --- Geometry & Mesh (Annulus mapped from Grid) ---
-        # 10mm Inner Radius, 12mm Outer Radius (2mm thickness)
-        self.Ri, self.Ro = 10.0, 12.0
-        n_radial, n_circum = 6, 60  # Mesh density
+        # --- Mesh Generation ---
+        self.n_radial, self.n_circum = 6, 60
+        r_min, r_max = 10.0, 12.0
         
-        # Create grid in (r, theta) space and map to (x, y)
-        r = np.linspace(self.Ri, self.Ro, n_radial)
-        t = np.linspace(0, 2*np.pi, n_circum + 1)[:-1] # 0 to 360 (periodic)
+        # Create topology
+        r = np.linspace(r_min, r_max, self.n_radial)
+        t = np.linspace(0, 2*np.pi, self.n_circum + 1)[:-1]
         R, T = np.meshgrid(r, t)
         X = R * np.cos(T)
         Y = R * np.sin(T)
         
-        # Create FElupe Mesh (Quad elements)
-        points = np.stack([X.ravel(), Y.ravel()], axis=1)
-        # Simple connectivity generation for structured grid
-        cells = []
-        for i in range(n_circum):
-            for j in range(n_radial - 1):
-                p0 = i * n_radial + j
-                p1 = p0 + 1
-                p2 = ((i + 1) % n_circum) * n_radial + j + 1
-                p3 = ((i + 1) % n_circum) * n_radial + j
-                cells.append([p0, p1, p2, p3])
+        # Flatten for skfem (2, N_nodes)
+        p = np.vstack([X.ravel(), Y.ravel()])
         
-        self.mesh = fe.Mesh(points, np.array(cells), "quad")
+        # Create elements
+        t_conn = []
+        for i in range(self.n_circum):
+            for j in range(self.n_radial - 1):
+                n0 = i * self.n_radial + j
+                n1 = n0 + 1
+                n2 = ((i + 1) % self.n_circum) * self.n_radial + j + 1
+                n3 = ((i + 1) % self.n_circum) * self.n_radial + j
+                t_conn.append([n0, n1, n2, n3])
         
-        # --- Constitutive Model (Rubber-like Material) ---
-        # Neo-Hookean (Incompressible approximation)
-        self.region = fe.RegionQuad(self.mesh)
-        self.field = fe.FieldContainer([fe.Field(self.region, dim=2)])
-        self.solid = fe.SolidBody(self.umat, self.field)
+        t_conn = np.array(t_conn).T
+        self.mesh = MeshQuad(p, t_conn)
+        self.n_nodes = self.mesh.p.shape[1]
         
-        # --- Boundary Condition Setup (6 Points) ---
-        # Find node indices closest to 6 servo angles (0, 60, 120, ...)
-        self.servo_angles_deg = np.array([0, 60, 120, 180, 240, 300])
-        self.servo_nodes = []
+        # --- Material ---
+        self.lam, self.mu = lame_parameters(E=10.0, nu=0.4)
         
-        # We hook the INNER radius (pulling outward)
-        inner_nodes = np.where(np.abs(np.linalg.norm(self.mesh.points, axis=1) - self.Ri) < 0.1)[0]
+        # --- Basis & Assembly ---
+        # ElementVector ensures 2 DOFs per node
+        self.element = ElementVector(ElementQuad1())
+        self.basis = Basis(self.mesh, self.element, intorder=2)
         
-        for angle in self.servo_angles_deg:
-            rad = np.radians(angle)
-            # Find closest node on inner ring to this angle
-            target_pos = np.array([self.Ri * np.cos(rad), self.Ri * np.sin(rad)])
-            dists = np.linalg.norm(self.mesh.points[inner_nodes] - target_pos, axis=1)
-            closest = inner_nodes[np.argmin(dists)]
-            self.servo_nodes.append(closest)
-
-    def umat(self, F, mu=1.0, bulk=50.0):
-        """Neo-Hookean Hyperelastic Material Definition"""
-        C = fe.math.dot(fe.math.transpose(F), F)
-        J = fe.math.det(F)
-        I1 = fe.math.trace(C)
-        # Strain Energy Function W
-        W = (mu / 2) * (I1 - 2 - 2 * fe.math.ln(J)) + (bulk / 2) * (J - 1)**2
-        # First Piola-Kirchhoff Stress P = dW/dF
-        P = fe.math.d_diff(W, F)
-        return P
+        # Stiffness Matrix (K) - Assembled ONCE
+        # K shape should be (2*N_nodes, 2*N_nodes)
+        self.K = asm(linear_elasticity(self.lam, self.mu), self.basis)
+        
+        # --- Identify Servo Nodes ---
+        self.servo_angles = np.array([0, 60, 120, 180, 240, 300])
+        self.servo_node_indices = []
+        
+        pts = self.mesh.p
+        dist_from_center = np.linalg.norm(pts, axis=0)
+        inner_mask = np.abs(dist_from_center - r_min) < 0.1
+        inner_indices = np.where(inner_mask)[0]
+        
+        for angle_deg in self.servo_angles:
+            angle_rad = np.radians(angle_deg)
+            target = np.array([r_min * np.cos(angle_rad), r_min * np.sin(angle_rad)])
+            dists = np.linalg.norm(pts[:, inner_indices].T - target, axis=1)
+            closest_local_idx = np.argmin(dists)
+            self.servo_node_indices.append(inner_indices[closest_local_idx])
 
     def solve(self, displacements_mm):
-        """
-        Run one step of static equilibrium.
-        displacements_mm: list of 6 radial displacements (floats)
-        """
-        boundaries = {}
+        # 1. Map Constraint DOFs manually
+        # ElementVector DOFs are usually ordered: [u_x_all, u_y_all] or interleaved
+        # nodal_dofs has shape (2, N_nodes). 
+        # Row 0 -> X DOFs, Row 1 -> Y DOFs
+        dof_map = self.basis.nodal_dofs 
         
-        # Apply Dirichlet BCs for each servo
-        for i, u_r in enumerate(displacements_mm):
-            node_idx = self.servo_nodes[i]
-            angle_rad = np.radians(self.servo_angles_deg[i])
+        cons_dofs = []
+        cons_vals = []
+        
+        for i, dist in enumerate(displacements_mm):
+            angle_rad = np.radians(self.servo_angles[i])
+            ux = dist * np.cos(angle_rad)
+            uy = dist * np.sin(angle_rad)
             
-            # Convert radial displacement to (dx, dy)
-            # Total position = Original + Displacement
-            # BC in FElupe is usually total displacement value
-            ux = u_r * np.cos(angle_rad)
-            uy = u_r * np.sin(angle_rad)
+            node_idx = self.servo_node_indices[i]
             
-            # Apply to both X and Y DOFs of that node
-            boundaries[f"servo_{i}_x"] = fe.Boundary(self.field[0], fx=ux, skip=(0,1), mask=node_idx)
-            boundaries[f"servo_{i}_y"] = fe.Boundary(self.field[0], fy=uy, skip=(1,0), mask=node_idx)
+            # X-DOF constraint
+            cons_dofs.append(dof_map[0, node_idx])
+            cons_vals.append(ux)
             
-        # Add basic rigid body constraint if needed (e.g. fix center if it were a disk)
-        # For a ring pulled 6 ways, it's self-equilibrated, but numerical drift can occur.
-        # Here we rely on the 6 points to hold it in place.
-
-        # Solve (Newton-Raphson)
-        try:
-            step = fe.Step(items=[self.solid], boundaries=boundaries)
-            job = fe.Job(steps=[step])
-            job.evaluate(verbose=False) # Run the solver
-        except Exception as e:
-            print(f"Solver diverged: {e}")
-            return None, None
-
-        # --- Post-Processing: Reaction Forces ---
-        # F_reaction = F_internal (at constrained nodes)
-        # FElupe stores internal force vector in step.fun (residual) 
-        # But easier is to re-evaluate internal forces with current deformation
-        forces = self.solid.results.force # shape (N_nodes, 2)
+            # Y-DOF constraint
+            cons_dofs.append(dof_map[1, node_idx])
+            cons_vals.append(uy)
+            
+        cons_dofs = np.array(cons_dofs)
+        cons_vals = np.array(cons_vals)
+        
+        # 2. Solve using condense manually (Robust)
+        # Identify free DOFs
+        all_dofs = np.arange(self.basis.N)
+        free_dofs = np.setdiff1d(all_dofs, cons_dofs)
+        
+        # Initialize full solution vector u
+        u = np.zeros(self.basis.N)
+        u[cons_dofs] = cons_vals # Set Dirichlet values
+        
+        # Solve for Free DOFs: K_ff * u_f = -K_fc * u_c
+        # R = K * u (Residual) -> R_f = 0
+        # K_ff * u_f + K_fc * u_c = 0  =>  K_ff * u_f = -K_fc * u_c
+        
+        K_ff = self.K[free_dofs, :][:, free_dofs]
+        K_fc = self.K[free_dofs, :][:, cons_dofs]
+        
+        rhs = -K_fc @ cons_vals
+        
+        # Linear Solve
+        u_free = splinalg.spsolve(K_ff, rhs)
+        u[free_dofs] = u_free
+        
+        # 3. Calculate Reaction Forces (R = K * u)
+        # R is global residual force vector
+        f_reaction_global = self.K @ u
         
         reaction_forces = []
-        for i, node_idx in enumerate(self.servo_nodes):
-            fx = forces[node_idx][0]
-            fy = forces[node_idx][1]
-            # Project force onto radial direction (Pulling force)
-            angle_rad = np.radians(self.servo_angles_deg[i])
-            f_radial = fx * np.cos(angle_rad) + fy * np.sin(angle_rad)
-            reaction_forces.append(f_radial)
+        for i in range(6):
+            node_idx = self.servo_node_indices[i]
+            dx = dof_map[0, node_idx]
+            dy = dof_map[1, node_idx]
             
-        # Get deformed points for plotting
-        deformed_points = self.mesh.points + self.field[0].values
+            rx = f_reaction_global[dx]
+            ry = f_reaction_global[dy]
+            
+            # Project to radial
+            angle_rad = np.radians(self.servo_angles[i])
+            fr = rx * np.cos(angle_rad) + ry * np.sin(angle_rad)
+            reaction_forces.append(fr)
+            
+        # 4. Deform Mesh
+        u_reshaped = u[dof_map] # (2, N_nodes)
+        deformed_p = self.mesh.p + u_reshaped
         
-        return deformed_points, reaction_forces
+        return deformed_p.T, reaction_forces, self.mesh.t.T
 
 # ==============================================================================
-# 2. GUI: Servo Control & Visualization (PyQt5)
+# 2. Worker Thread
 # ==============================================================================
-class MainWindow(QMainWindow):
+class SimulationWorker(QObject):
+    result_ready = pyqtSignal(object, object, object)
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("O-Ring Multi-Axis Tension Simulation")
-        self.resize(1000, 700)
-        
-        # Initialize Physics
-        self.sim = ORingSimulation()
-        self.servo_vals = [0.0] * 6  # Current servo displacements (mm)
+        self.solver = SkfemSolver()
 
-        # Layouts
+    def run_sim(self, inputs):
+        pts, forces, cells = self.solver.solve(inputs)
+        self.result_ready.emit(pts, forces, cells)
+
+# ==============================================================================
+# 3. Main GUI
+# ==============================================================================
+class MainWindow(QMainWindow):
+    request_solve = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("O-Ring Simulation (Scikit-FEM Explicit)")
+        self.resize(1100, 750)
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         
-        # --- Left Panel: Controls ---
-        control_panel = QGroupBox("Servo Controls (0° - 180°)")
-        control_layout = QVBoxLayout()
+        # Controls
+        control_panel = QGroupBox("Servo Controls")
         control_panel.setFixedWidth(300)
+        layout = QVBoxLayout()
         
         self.sliders = []
-        self.force_labels = []
-        
+        self.labels = []
         grid = QGridLayout()
+        
+        angles = [0, 60, 120, 180, 240, 300]
         for i in range(6):
-            # Label
-            lbl = QLabel(f"Servo #{i+1} (Pos: {self.sim.servo_angles_deg[i]}°)")
-            grid.addWidget(lbl, i, 0)
+            grid.addWidget(QLabel(f"Servo {i+1} ({angles[i]}°)"), i, 0)
             
-            # Slider (0-180 degrees -> maps to 0-5mm)
-            slider = QSlider(Qt.Horizontal)
-            slider.setRange(0, 180)
-            slider.setValue(0)
-            slider.valueChanged.connect(self.on_slider_change)
-            self.sliders.append(slider)
-            grid.addWidget(slider, i, 1)
+            s = QSlider(Qt.Horizontal)
+            s.setRange(0, 100)
+            s.valueChanged.connect(self.trigger_solve)
+            self.sliders.append(s)
+            grid.addWidget(s, i, 1)
             
-            # Force Display
-            f_lbl = QLabel("0.00 N")
-            f_lbl.setStyleSheet("color: red; font-weight: bold;")
-            self.force_labels.append(f_lbl)
-            grid.addWidget(f_lbl, i, 2)
+            l = QLabel("0.00 N")
+            l.setStyleSheet("color: red; font-weight: bold")
+            self.labels.append(l)
+            grid.addWidget(l, i, 2)
             
-        control_layout.addLayout(grid)
+        layout.addLayout(grid)
+        layout.addStretch()
+        control_panel.setLayout(layout)
         
-        # Global controls
-        btn_reset = QLabel("Drag sliders to pull O-ring.\nCalculations are real-time.")
-        control_layout.addWidget(btn_reset)
-        control_layout.addStretch()
-        control_panel.setLayout(control_layout)
-        
-        # --- Right Panel: Visualization ---
-        self.canvas = FigureCanvas(Figure(figsize=(5, 5)))
+        # Plot
+        self.canvas = FigureCanvas(Figure(figsize=(5,5)))
         self.ax = self.canvas.figure.add_subplot(111)
         self.ax.set_aspect('equal')
+        self.ax.grid(True, linestyle=':')
+        self.ax.set_xlim(-15, 15)
+        self.ax.set_ylim(-15, 15)
+        self.poly = None
         
         main_layout.addWidget(control_panel)
         main_layout.addWidget(self.canvas)
         
-        # Initial Plot
-        self.plot_mesh(self.sim.mesh.points, [0]*6)
+        # Threading
+        self.thread = QThread()
+        self.worker = SimulationWorker()
+        self.worker.moveToThread(self.thread)
+        self.request_solve.connect(self.worker.run_sim)
+        self.worker.result_ready.connect(self.update_view)
+        
+        self.thread.start()
+        
+        # Init
+        self.trigger_solve()
 
-    def on_slider_change(self):
-        # 1. Read Sliders -> Convert Angle to Displacement
-        # Mapping: Servo 0-180 deg -> 0-5 mm Extension
-        displacements = []
-        for s in self.sliders:
-            angle = s.value()
-            # Simple Linear Mapping: 180 deg = 5mm stretch
-            d = (angle / 180.0) * 5.0 
-            displacements.append(d)
-        
-        # 2. Solve Physics
-        deformed_pts, forces = self.sim.solve(displacements)
-        
-        if deformed_pts is not None:
-            # 3. Update GUI
-            self.plot_mesh(deformed_pts, forces)
-            
-            for i, f in enumerate(forces):
-                self.force_labels[i].setText(f"{f:.2f} N")
+    def trigger_solve(self):
+        vals = [(s.value()/100.0)*3.0 for s in self.sliders]
+        self.request_solve.emit(vals)
 
-    def plot_mesh(self, points, forces):
-        self.ax.clear()
-        
-        # Plot O-Ring Elements (as simple polygons or scatter for speed)
-        # Using a simple fill for visualization
-        # Separate Inner/Outer loop for clean drawing? 
-        # For simplicity in 'quad' mesh, we just plot all cells as polygons
-        
-        # Create a QuadMesh collection for matplotlib (fastest)
-        from matplotlib.collections import PolyCollection
-        
-        # Extract cell coordinates
-        cells = self.sim.mesh.cells
-        coords = points[cells] # shape (n_cells, 4, 2)
-        
-        pc = PolyCollection(coords, edgecolors='k', facecolors='skyblue', alpha=0.7, linewidths=0.5)
-        self.ax.add_collection(pc)
-        
-        # Draw Arrows for Forces at Servo Nodes
-        for i, node_idx in enumerate(self.sim.servo_nodes):
-            p = points[node_idx]
-            f = forces[i] if forces else 0
-            # Scale arrow by force
-            scale = 0.5
-            angle_rad = np.radians(self.sim.servo_angles_deg[i])
-            dx = (f * scale) * np.cos(angle_rad)
-            dy = (f * scale) * np.sin(angle_rad)
+    def update_view(self, pts, forces, cells):
+        if self.poly is None:
+            self.poly = PolyCollection(pts[cells], facecolors='skyblue', edgecolors='k', alpha=0.7, linewidths=0.5)
+            self.ax.add_collection(self.poly)
+        else:
+            self.poly.set_verts(pts[cells])
             
-            # Anchor point
-            self.ax.plot(p[0], p[1], 'ro', markersize=5) # Servo point
-            if abs(f) > 0.1:
-                self.ax.arrow(p[0], p[1], dx, dy, head_width=0.5, head_length=0.5, fc='r', ec='r')
-        
-        # Set limits
-        limit = 18
-        self.ax.set_xlim(-limit, limit)
-        self.ax.set_ylim(-limit, limit)
-        self.ax.grid(True, linestyle=':')
-        self.ax.set_title("O-Ring Deformation & Reaction Forces")
-        
+        for i, f in enumerate(forces):
+            self.labels[i].setText(f"{f:.2f} N")
+            
         self.canvas.draw()
+
+    def closeEvent(self, e):
+        self.thread.quit()
+        super().closeEvent(e)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec_())
