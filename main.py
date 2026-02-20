@@ -7,8 +7,9 @@ from scipy.sparse import linalg as splinalg
 warnings.filterwarnings("ignore")
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QSlider, QLabel, QGroupBox, QGridLayout)
+                             QHBoxLayout, QLabel, QGroupBox, QGridLayout, QLineEdit, QPushButton)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QDoubleValidator, QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.collections import PolyCollection
@@ -55,12 +56,10 @@ class SkfemSolver:
         self.lam, self.mu = lame_parameters(E=10.0, nu=0.4)
         
         # --- Basis & Assembly ---
-        # ElementVector ensures 2 DOFs per node
         self.element = ElementVector(ElementQuad1())
         self.basis = Basis(self.mesh, self.element, intorder=2)
         
         # Stiffness Matrix (K) - Assembled ONCE
-        # K shape should be (2*N_nodes, 2*N_nodes)
         self.K = asm(linear_elasticity(self.lam, self.mu), self.basis)
         
         # --- Identify Servo Nodes ---
@@ -80,10 +79,6 @@ class SkfemSolver:
             self.servo_node_indices.append(inner_indices[closest_local_idx])
 
     def solve(self, displacements_mm):
-        # 1. Map Constraint DOFs manually
-        # ElementVector DOFs are usually ordered: [u_x_all, u_y_all] or interleaved
-        # nodal_dofs has shape (2, N_nodes). 
-        # Row 0 -> X DOFs, Row 1 -> Y DOFs
         dof_map = self.basis.nodal_dofs 
         
         cons_dofs = []
@@ -107,30 +102,22 @@ class SkfemSolver:
         cons_dofs = np.array(cons_dofs)
         cons_vals = np.array(cons_vals)
         
-        # 2. Solve using condense manually (Robust)
-        # Identify free DOFs
+        # Solve using condense manually
         all_dofs = np.arange(self.basis.N)
         free_dofs = np.setdiff1d(all_dofs, cons_dofs)
         
-        # Initialize full solution vector u
         u = np.zeros(self.basis.N)
-        u[cons_dofs] = cons_vals # Set Dirichlet values
-        
-        # Solve for Free DOFs: K_ff * u_f = -K_fc * u_c
-        # R = K * u (Residual) -> R_f = 0
-        # K_ff * u_f + K_fc * u_c = 0  =>  K_ff * u_f = -K_fc * u_c
+        u[cons_dofs] = cons_vals 
         
         K_ff = self.K[free_dofs, :][:, free_dofs]
         K_fc = self.K[free_dofs, :][:, cons_dofs]
         
         rhs = -K_fc @ cons_vals
         
-        # Linear Solve
         u_free = splinalg.spsolve(K_ff, rhs)
         u[free_dofs] = u_free
         
-        # 3. Calculate Reaction Forces (R = K * u)
-        # R is global residual force vector
+        # Calculate Reaction Forces (R = K * u)
         f_reaction_global = self.K @ u
         
         reaction_forces = []
@@ -147,8 +134,8 @@ class SkfemSolver:
             fr = rx * np.cos(angle_rad) + ry * np.sin(angle_rad)
             reaction_forces.append(fr)
             
-        # 4. Deform Mesh
-        u_reshaped = u[dof_map] # (2, N_nodes)
+        # Deform Mesh
+        u_reshaped = u[dof_map] 
         deformed_p = self.mesh.p + u_reshaped
         
         return deformed_p.T, reaction_forces, self.mesh.t.T
@@ -175,7 +162,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("O-Ring Simulation (Scikit-FEM Explicit)")
+        self.setWindowTitle("O-Ring Simulation (Inputs + Reset)")
         self.resize(1100, 750)
         
         central_widget = QWidget()
@@ -183,31 +170,55 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout(central_widget)
         
         # Controls
-        control_panel = QGroupBox("Servo Controls")
-        control_panel.setFixedWidth(300)
+        control_panel = QGroupBox("Servo Inputs (0° - 180°)")
+        control_panel.setFixedWidth(350)
         layout = QVBoxLayout()
         
-        self.sliders = []
+        self.inputs = []
         self.labels = []
         grid = QGridLayout()
         
         angles = [0, 60, 120, 180, 240, 300]
+        
+        # Add Header
+        grid.addWidget(QLabel("<b>Servo</b>"), 0, 0)
+        grid.addWidget(QLabel("<b>Input Angle (°)</b>"), 0, 1)
+        grid.addWidget(QLabel("<b>Reaction (N)</b>"), 0, 2)
+
         for i in range(6):
-            grid.addWidget(QLabel(f"Servo {i+1} ({angles[i]}°)"), i, 0)
+            # 1. Servo Label
+            grid.addWidget(QLabel(f"Servo {i+1} ({angles[i]}°)"), i+1, 0)
             
-            s = QSlider(Qt.Horizontal)
-            s.setRange(0, 100)
-            s.valueChanged.connect(self.trigger_solve)
-            self.sliders.append(s)
-            grid.addWidget(s, i, 1)
+            # 2. Input Box (QLineEdit)
+            inp = QLineEdit("0.0")
+            inp.setValidator(QDoubleValidator(0.0, 180.0, 2)) # 0-180 range, 2 decimals
+            inp.setAlignment(Qt.AlignRight)
+            inp.editingFinished.connect(self.trigger_solve) # Update on Enter/FocusOut
+            self.inputs.append(inp)
+            grid.addWidget(inp, i+1, 1)
             
+            # 3. Force Label
             l = QLabel("0.00 N")
             l.setStyleSheet("color: red; font-weight: bold")
+            l.setAlignment(Qt.AlignRight)
             self.labels.append(l)
-            grid.addWidget(l, i, 2)
+            grid.addWidget(l, i+1, 2)
             
         layout.addLayout(grid)
+        
+        # RESET BUTTON
+        btn_reset = QPushButton("RESET ALL")
+        btn_reset.setFixedHeight(40)
+        btn_reset.setStyleSheet("background-color: #ffcccc; font-weight: bold; border-radius: 5px;")
+        btn_reset.clicked.connect(self.reset_all)
+        layout.addWidget(btn_reset)
+        
         layout.addStretch()
+        
+        info_label = QLabel("Enter angle (0-180) and press Enter.\n0° = 0mm, 180° = 3mm stretch")
+        info_label.setStyleSheet("color: gray")
+        layout.addWidget(info_label)
+        
         control_panel.setLayout(layout)
         
         # Plot
@@ -234,8 +245,28 @@ class MainWindow(QMainWindow):
         # Init
         self.trigger_solve()
 
+    def reset_all(self):
+        # Set all inputs to 0.0
+        for inp in self.inputs:
+            inp.setText("0.0")
+        # Trigger solve to update physics
+        self.trigger_solve()
+
     def trigger_solve(self):
-        vals = [(s.value()/100.0)*3.0 for s in self.sliders]
+        vals = []
+        for inp in self.inputs:
+            try:
+                text = inp.text()
+                angle = float(text) if text else 0.0
+            except ValueError:
+                angle = 0.0
+            
+            # Mapping: 0-180 degree input -> 0-3.0 mm displacement
+            # Clamp to safe range
+            angle = max(0.0, min(180.0, angle))
+            disp = (angle / 180.0) * 3.0 
+            vals.append(disp)
+            
         self.request_solve.emit(vals)
 
     def update_view(self, pts, forces, cells):
