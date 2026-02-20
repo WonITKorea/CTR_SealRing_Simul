@@ -13,7 +13,7 @@ pip install -r requirements.txt
 2. **Run the Main.py**:
 
 ```bash
-python3 main,py
+python3 main.py
 ```
 
 ### Why these packages?
