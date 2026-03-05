@@ -10,7 +10,6 @@ from PyQt5.QtCore import QTimer
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_pdf import PdfPages
 from scipy.interpolate import interp1d
 import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
@@ -23,7 +22,6 @@ if platform.system() == 'Windows':
 elif platform.system() == 'Darwin':
     font_path = '/System/Library/Fonts/Supplemental/AppleGothic.ttf'
 else:
-    # Linux (Ubuntu)
     font_path = '/usr/share/fonts/truetype/nanum/NanumGothic.ttf'
 
 if os.path.exists(font_path):
@@ -103,9 +101,12 @@ class ClampSimulatorApp(QMainWindow):
         
         self.sensor_zeros = [0.0] * 6
         self.raw_data = [0.0] * 6
-        self.stroke_data_history = []
         
-        # 파일 저장 시 고정될 테스트 시작 타임스탬프
+        # 데이터 저장소
+        self.stroke_data_history = []  # 각 스트로크 최종 결과 저장
+        self.time_series_data = []     # 실시간 시계열 로깅 데이터 저장
+        self.time_elapsed = 0.0        # 시계열용 누적 시간
+        
         self.test_start_ts = None
         self.test_start_display_time = None
         
@@ -121,7 +122,6 @@ class ClampSimulatorApp(QMainWindow):
         scroll_widget = QWidget()
         left_panel = QVBoxLayout(scroll_widget)
         
-        # 성적서 입력 탭
         group_report = QGroupBox("Report Information")
         layout_report = QGridLayout()
         layout_report.addWidget(QLabel("관리번호 (Report No):"), 0, 0)
@@ -142,7 +142,6 @@ class ClampSimulatorApp(QMainWindow):
         group_report.setLayout(layout_report)
         left_panel.addWidget(group_report)
 
-        # 지그 사이즈 설정
         group_jig = QGroupBox("Jig Size & Camera Focus")
         layout_jig = QVBoxLayout()
         self.jig_combo = QComboBox()
@@ -155,7 +154,6 @@ class ClampSimulatorApp(QMainWindow):
         group_jig.setLayout(layout_jig)
         left_panel.addWidget(group_jig)
         
-        # 테스트 파라미터
         group_params = QGroupBox("Test Parameters")
         layout_params = QGridLayout()
         layout_params.addWidget(QLabel("Min Length (mm):"), 0, 0)
@@ -182,7 +180,6 @@ class ClampSimulatorApp(QMainWindow):
         group_params.setLayout(layout_params)
         left_panel.addWidget(group_params)
         
-        # 세팅
         group_settings = QGroupBox("Settings")
         layout_settings = QVBoxLayout()
         self.unit_combo = QComboBox()
@@ -212,7 +209,6 @@ class ClampSimulatorApp(QMainWindow):
         scroll_area.setWidget(scroll_widget)
         main_layout.addWidget(scroll_area, 1)
         
-        # 우측 패널
         right_panel = QVBoxLayout()
         self.chart = SpiderChartCanvas(self, width=6, height=5)
         right_panel.addWidget(self.chart, 3)
@@ -223,7 +219,7 @@ class ClampSimulatorApp(QMainWindow):
         for i in range(6):
             self.table.setItem(i, 0, QTableWidgetItem(f"Axis {i+1}"))
             for j in range(1, 4):
-                self.table.setItem(i, j, QTableWidgetItem("0.0"))
+                self.table.setItem(i, j, QTableWidgetItem("0.00"))
         right_panel.addWidget(self.table, 1)
         
         btn_layout = QHBoxLayout()
@@ -250,28 +246,26 @@ class ClampSimulatorApp(QMainWindow):
         self.update_chart()
 
     def zero_sensors(self):
-        # 모든 물리적 데이터와 영점 기준을 0으로 강제 초기화
+        # 모든 물리적 데이터, 영점 기준, 그리고 이전 테스트 기록과 시계열 데이터 완전히 리셋
         self.raw_data = [0.0] * 6
         self.sensor_zeros = [0.0] * 6
         self.sim_current_load = 0.0
+        
         self.stroke_data_history = []
+        self.time_series_data = []
+        self.time_elapsed = 0.0
+        
         self.test_start_ts = None
         self.test_start_display_time = None
         
-        # 표(Table) 내부 텍스트를 강제로 "0.00"으로 덮어쓰기
         for i in range(6):
-            # Raw Data
             self.table.setItem(i, 1, QTableWidgetItem("0.00"))
-            # Zero Offset
             self.table.setItem(i, 2, QTableWidgetItem("0.00"))
-            # Calibrated Value 
             self.table.setItem(i, 3, QTableWidgetItem("0.00"))
 
         self.lbl_status.setText("Status: Ready (Data Reset)")
-        
-        self.update_chart() # 차트도 0점으로 다시 그림
-        
-        QMessageBox.information(self, "Zeroed", "센서 영점 맞춤 및 데이터 초기화가 완료되었습니다.")
+        self.update_chart()
+        QMessageBox.information(self, "Zeroed", "센서 영점 맞춤 및 이전 데이터 초기화가 완료되었습니다.")
 
     def update_table(self):
         for i in range(6):
@@ -321,9 +315,12 @@ class ClampSimulatorApp(QMainWindow):
 
             self.is_simulating = True
             self.current_stroke = 0
-            self.stroke_data_history = []
             
-            # 테스트 시작 시점에 파일 이름용 타임스탬프 저장
+            # 새 테스트 시작 시 이력 리셋
+            self.stroke_data_history = []
+            self.time_series_data = []
+            self.time_elapsed = 0.0
+            
             now = datetime.now()
             self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
             self.test_start_display_time = now.strftime('%Y-%m-%d %H:%M:%S')
@@ -340,6 +337,8 @@ class ClampSimulatorApp(QMainWindow):
 
     def simulation_step(self):
         load_step = self.target_load / (1500 / self.timer_interval) 
+        
+        # 1. 상태에 따른 하중 논리 갱신
         if self.sim_state == "PULLING":
             self.sim_current_load += load_step
             if self.sim_current_load >= self.target_load:
@@ -357,15 +356,8 @@ class ClampSimulatorApp(QMainWindow):
             self.sim_current_load -= load_step
             if self.sim_current_load <= 0:
                 self.sim_current_load = 0.0
-                self.current_stroke += 1
-                if self.current_stroke >= self.target_strokes:
-                    self.stop_simulation(completed=True)
-                    QMessageBox.information(self, "Test Complete", f"{self.target_strokes} Strokes 테스트가 완료되었습니다.")
-                    return
-                else:
-                    self.sim_state = "PULLING"
 
-        self.lbl_status.setText(f"Status: {self.sim_state} ({self.current_stroke} / {self.target_strokes} Strokes)")
+        # 2. 물리적 Raw Data 시뮬레이션 적용 및 UI 반영
         noise = np.random.normal(0, max(0.05, self.target_load * 0.01), 6)
         dist_factors = [1.0, 0.96, 1.04, 0.98, 1.02, 1.0] 
         for i in range(6):
@@ -374,8 +366,44 @@ class ClampSimulatorApp(QMainWindow):
             else:
                 val = self.sim_current_load * dist_factors[i] + noise[i]
             self.raw_data[i] = max(0, val) + self.sensor_zeros[i]
+            
         self.update_table()
         self.update_chart()
+
+        # 3. 실시간 시계열 데이터 로깅 (Raw 데이터 및 Calibrated 데이터 모두 저장)
+        self.time_elapsed += self.timer_interval / 1000.0
+        current_calibrated = [max(0, self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
+        if self.unit == "N":
+            current_calibrated = [v * 9.80665 for v in current_calibrated]
+            
+        log_row = {
+            'Time [sec]': round(self.time_elapsed, 1),
+            'Stroke': self.current_stroke + 1 if self.current_stroke < self.target_strokes else self.target_strokes,
+            'State': self.sim_state
+        }
+        
+        # 1~6축 Raw Data 추가
+        for i in range(6):
+            log_row[f'Axis {i+1} Raw'] = round(self.raw_data[i], 2)
+            
+        # 1~6축 Calibrated Data 추가
+        for i in range(6):
+            log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated[i], 2)
+            
+        self.time_series_data.append(log_row)
+
+        # 4. 스트로크 완료 여부 체크 및 상태 전환
+        if self.sim_state == "RELEASING" and self.sim_current_load <= 0:
+            self.current_stroke += 1
+            if self.current_stroke >= self.target_strokes:
+                self.stop_simulation(completed=True)
+                QMessageBox.information(self, "Test Complete", f"{self.target_strokes} Strokes 테스트가 완료되었습니다.")
+                return
+            else:
+                self.sim_state = "PULLING"
+
+        if self.is_simulating:
+            self.lbl_status.setText(f"Status: {self.sim_state} ({self.current_stroke} / {self.target_strokes} Strokes)")
 
     def export_csv(self):
         if len(self.stroke_data_history) == 0:
@@ -387,17 +415,61 @@ class ClampSimulatorApp(QMainWindow):
         file_name, _ = QFileDialog.getSaveFileName(self, "Save CSV", default_name, "CSV Files (*.csv)")
         
         if file_name:
-            stroke_records = []
-            for idx, stroke_data in enumerate(self.stroke_data_history):
-                for axis_idx, value in enumerate(stroke_data):
-                    display_val = value * 9.80665 if self.unit == "N" else value
-                    stroke_records.append({
-                        'Stroke': idx + 1,
-                        'Axis': f'Axis {axis_idx + 1}',
-                        f'Load ({self.unit})': round(display_val, 2)
-                    })
-            pd.DataFrame(stroke_records).to_csv(file_name, index=False, encoding='utf-8-sig')
-            QMessageBox.information(self, "Saved", f"CSV 파일이 저장되었습니다.\n{file_name}")
+            all_data = np.array(self.stroke_data_history)
+            if self.unit == "N":
+                all_data = all_data * 9.80665
+
+            # ============ 1. 상단 요약본 (스트로크 통계) ============
+            records = []
+            for idx, stroke_data in enumerate(all_data):
+                row_dict = {'No': f'Stroke {idx + 1}', 'Stroke [mm]': self.in_max_len.text()}
+                for axis_idx in range(6):
+                    row_dict[f'Axis {axis_idx + 1} [{self.unit}]'] = round(stroke_data[axis_idx], 2)
+                row_dict[f'Average [{self.unit}]'] = round(np.mean(stroke_data), 2)
+                records.append(row_dict)
+
+            df_main = pd.DataFrame(records)
+
+            min_vals = np.min(all_data, axis=0)
+            max_vals = np.max(all_data, axis=0)
+            range_vals = max_vals - min_vals
+            avg_vals = np.mean(all_data, axis=0)
+
+            stat_rows = [
+                {'No': 'Min', 'Stroke [mm]': self.in_max_len.text()},
+                {'No': 'Max', 'Stroke [mm]': self.in_max_len.text()},
+                {'No': 'R (Range)', 'Stroke [mm]': '0.00'},
+                {'No': 'Ave (Total)', 'Stroke [mm]': self.in_max_len.text()}
+            ]
+
+            for i in range(6):
+                col_name = f'Axis {i + 1} [{self.unit}]'
+                stat_rows[0][col_name] = round(min_vals[i], 2)
+                stat_rows[1][col_name] = round(max_vals[i], 2)
+                stat_rows[2][col_name] = round(range_vals[i], 2)
+                stat_rows[3][col_name] = round(avg_vals[i], 2)
+
+            avg_col_name = f'Average [{self.unit}]'
+            stat_rows[0][avg_col_name] = round(np.min(all_data), 2)
+            stat_rows[1][avg_col_name] = round(np.max(all_data), 2)
+            stat_rows[2][avg_col_name] = round(np.max(range_vals), 2)
+            stat_rows[3][avg_col_name] = round(np.mean(all_data), 2)
+
+            df_stats = pd.DataFrame(stat_rows)
+            df_final = pd.concat([df_main, df_stats], ignore_index=True)
+            
+            # 요약본 파일에 우선 저장
+            df_final.to_csv(file_name, index=False, encoding='utf-8-sig')
+            
+            # ============ 2. 하단 시계열 (Time Series Raw Data) ============
+            with open(file_name, 'a', encoding='utf-8-sig') as f:
+                f.write('\n\n--- Time Series Raw & Calibrated Data ---\n')
+            
+            df_ts = pd.DataFrame(self.time_series_data)
+            # 모드를 'a'(Append)로 설정하여 기존 CSV 파일 아래에 이어서 작성
+            df_ts.to_csv(file_name, mode='a', index=False, encoding='utf-8-sig')
+            
+            QMessageBox.information(self, "Saved", f"CSV 파일이 성공적으로 저장되었습니다.\n{file_name}")
 
     def export_pdf(self):
         if len(self.stroke_data_history) == 0:
@@ -416,49 +488,38 @@ class ClampSimulatorApp(QMainWindow):
         # 메인 타이틀
         fig.text(0.35, 0.94, 'Test Report', ha='center', fontsize=20, fontproperties=font_prop, weight='bold')
         
-        # ==================== 수정된 결재란 테이블 ====================
-        ax_sign = fig.add_axes([0.62, 0.89, 0.30, 0.07])
+        # ==================== 완벽하게 고정된 결재란 ====================
+        ax_sign = fig.add_axes([0.65, 0.89, 0.27, 0.07])
         ax_sign.axis('off')
         
+        rect = Rectangle((0, 0), 0.15, 1, transform=ax_sign.transAxes, 
+                         facecolor='#F0F0F0', edgecolor='black', linewidth=0.8)
+        ax_sign.add_patch(rect)
+        
+        ax_sign.text(0.075, 0.5, 'SIGN', fontproperties=font_prop, fontsize=8, 
+                     ha='center', va='center', rotation='vertical')
+
         sign_data = [
-            ['', 'EDIT', 'CHECK', 'APPROVE'],
-            ['SIGN', '', '', '']
+            ['EDIT', 'CHECK', 'APPROVE'],
+            ['', '', '']
         ]
         
-        table_sign = ax_sign.table(cellText=sign_data, cellLoc='center', loc='center',
-                                   colWidths=[0.12, 0.29, 0.29, 0.29])
+        table_sign = ax_sign.table(cellText=sign_data, cellLoc='center',
+                                   bbox=[0.15, 0, 0.85, 1])
         table_sign.auto_set_font_size(False)
         table_sign.set_fontsize(8)
         
-        # scale() 대신 각 행의 높이를 개별적으로 디테일하게 제어
         for key, cell in table_sign.get_celld().items():
             row, col = key
             cell.set_edgecolor('black')
             cell.set_linewidth(0.8)
             cell.set_text_props(fontproperties=font_prop)
-            cell.set_facecolor('white')
-            
-            # 행(row)에 따른 높이 설정: 헤더는 낮게(0.3), 사인칸은 높게(1.5)
             if row == 0:
                 cell.set_height(0.3)
+                cell.set_facecolor('#F0F0F0')
             else:
-                cell.set_height(1.5)
-            
-            # 우측 3칸 헤더 배경색
-            if row == 0 and col > 0:
-                cell.set_facecolor('#F0F0F0')
-            
-            # SIGN 열 병합 트릭 및 세로 텍스트 적용
-            if col == 0:
-                cell.set_facecolor('#F0F0F0')
-                if row == 0:    
-                    cell.visible_edges = 'LRT' # 위쪽 테두리만
-                if row == 1:
-                    cell.visible_edges = 'LRB' # 아래쪽 테두리만
-                    text_obj = cell.get_text()
-                    text_obj.set_rotation('vertical') # 세로 쓰기 적용
-                    text_obj.set_position((1, 1.0)) # 위치를 아래쪽(빈칸) 중간으로 내림
-                    
+                cell.set_height(0.7)
+                cell.set_facecolor('white')
         # =============================================================
 
         # 헤더 테이블
