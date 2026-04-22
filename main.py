@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, 
+                             QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
                              QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFileDialog, QMessageBox, QScrollArea)
 from PyQt5.QtCore import QTimer
 import matplotlib.pyplot as plt
@@ -14,6 +14,17 @@ from scipy.interpolate import interp1d
 import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
 import platform
+
+from hardware import (
+    FC400_GROSS_MODE,
+    FC400_NET_MODE,
+    FC400ModbusClient,
+    MR_MC240N_WINDOWS_ONLY_MESSAGE,
+    MrMc240nPositionMonitor,
+    SERIAL_AVAILABLE,
+    SERIAL_IMPORT_ERROR,
+    list_serial_port_names,
+)
 
 try:
     import nidaqmx
@@ -43,7 +54,8 @@ except Exception as exc:
     NIDAQMX_IMPORT_ERROR = str(exc)
 
 SIMULATION_SOURCE = "Simulation"
-CDAQ_SOURCE = "cDAQ USB (1ch -> 6ch)"
+CDAQ_SOURCE = "NI cDAQ USB (1ch -> 6ch)"
+FC400_SOURCE = "UNIPULSE FC400 RS-485"
 DEFAULT_NI_9237_SAMPLE_RATE = 12_800_000.0 / 256.0 / 31.0
 
 # 한글 폰트 강제 로드 (OS 자동 인식)
@@ -130,14 +142,21 @@ class ClampSimulatorApp(QMainWindow):
         self.sim_current_load = 0.0
         self.timer_interval = 100 
         self.input_source = SIMULATION_SOURCE
+        self.data_unit = "kgf"
         
         self.sensor_zeros = [0.0] * 6
         self.raw_data = [0.0] * 6
         self.latest_live_snapshot = [0.0] * 6
         self.cdaq_task = None
+        self.fc400_client = None
+        self.position_monitor = None
+        self.latest_live_position_mm = None
+        self.latest_live_position_counts = None
+        self.position_zero_offset_mm = 0.0
         
         # 데이터 저장소
         self.stroke_data_history = []  # 각 스트로크 최종 결과 저장
+        self.stroke_position_history = []  # 각 스트로크의 대표 위치(mm) 저장
         self.time_series_data = []     # 실시간 시계열 로깅 데이터 저장
         self.time_elapsed = 0.0        # 시계열용 누적 시간
         
@@ -234,12 +253,12 @@ class ClampSimulatorApp(QMainWindow):
         group_settings.setLayout(layout_settings)
         left_panel.addWidget(group_settings)
 
-        group_daq = QGroupBox("cDAQ USB Input")
+        group_daq = QGroupBox("Load Input Source / NI cDAQ")
         layout_daq = QGridLayout()
 
         layout_daq.addWidget(QLabel("Input Source:"), 0, 0)
         self.source_combo = QComboBox()
-        self.source_combo.addItems([SIMULATION_SOURCE, CDAQ_SOURCE])
+        self.source_combo.addItems([SIMULATION_SOURCE, CDAQ_SOURCE, FC400_SOURCE])
         self.source_combo.currentTextChanged.connect(self.on_input_source_changed)
         layout_daq.addWidget(self.source_combo, 0, 1)
 
@@ -280,6 +299,97 @@ class ClampSimulatorApp(QMainWindow):
 
         group_daq.setLayout(layout_daq)
         left_panel.addWidget(group_daq)
+
+        group_fc400 = QGroupBox("UNIPULSE FC400 RS-485")
+        layout_fc400 = QGridLayout()
+
+        layout_fc400.addWidget(QLabel("Serial Port:"), 0, 0)
+        self.in_fc400_port = QLineEdit("")
+        layout_fc400.addWidget(self.in_fc400_port, 0, 1)
+
+        self.btn_refresh_serial = QPushButton("Refresh Serial Ports")
+        self.btn_refresh_serial.clicked.connect(self.refresh_serial_ports)
+        layout_fc400.addWidget(self.btn_refresh_serial, 1, 0, 1, 2)
+
+        layout_fc400.addWidget(QLabel("Baud Rate:"), 2, 0)
+        self.fc400_baud_combo = QComboBox()
+        self.fc400_baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.fc400_baud_combo.setCurrentText("115200")
+        layout_fc400.addWidget(self.fc400_baud_combo, 2, 1)
+
+        layout_fc400.addWidget(QLabel("Parity:"), 3, 0)
+        self.fc400_parity_combo = QComboBox()
+        self.fc400_parity_combo.addItems(["None", "Even", "Odd"])
+        layout_fc400.addWidget(self.fc400_parity_combo, 3, 1)
+
+        layout_fc400.addWidget(QLabel("Stop Bits:"), 4, 0)
+        self.fc400_stopbits_combo = QComboBox()
+        self.fc400_stopbits_combo.addItems(["1", "2"])
+        layout_fc400.addWidget(self.fc400_stopbits_combo, 4, 1)
+
+        layout_fc400.addWidget(QLabel("Slave ID:"), 5, 0)
+        self.in_fc400_slave_id = QLineEdit("1")
+        layout_fc400.addWidget(self.in_fc400_slave_id, 5, 1)
+
+        layout_fc400.addWidget(QLabel("Read Value:"), 6, 0)
+        self.fc400_weight_mode_combo = QComboBox()
+        self.fc400_weight_mode_combo.addItems([FC400_GROSS_MODE, FC400_NET_MODE])
+        layout_fc400.addWidget(self.fc400_weight_mode_combo, 6, 1)
+
+        layout_fc400.addWidget(QLabel("FC400 Unit:"), 7, 0)
+        self.fc400_device_unit_combo = QComboBox()
+        self.fc400_device_unit_combo.addItems(["N", "kgf"])
+        self.fc400_device_unit_combo.setCurrentText("N")
+        self.fc400_device_unit_combo.currentTextChanged.connect(self.on_source_configuration_changed)
+        layout_fc400.addWidget(self.fc400_device_unit_combo, 7, 1)
+
+        init_fc400_status = "FC400: set serial port and match FC400 RS-485 settings"
+        if not SERIAL_AVAILABLE:
+            init_fc400_status = f"FC400: pyserial import failed - {SERIAL_IMPORT_ERROR}"
+        self.lbl_fc400_status = QLabel(init_fc400_status)
+        self.lbl_fc400_status.setWordWrap(True)
+        layout_fc400.addWidget(self.lbl_fc400_status, 8, 0, 1, 2)
+
+        group_fc400.setLayout(layout_fc400)
+        left_panel.addWidget(group_fc400)
+
+        group_position = QGroupBox("Mitsubishi MR-MC240N Position Monitor")
+        layout_position = QGridLayout()
+
+        self.chk_position_monitor = QCheckBox("Enable MR-MC240N feedback position monitor")
+        self.chk_position_monitor.toggled.connect(self.on_position_monitor_toggled)
+        if os.name != "nt":
+            self.chk_position_monitor.setEnabled(False)
+        layout_position.addWidget(self.chk_position_monitor, 0, 0, 1, 2)
+
+        layout_position.addWidget(QLabel("API DLL Path (optional):"), 1, 0)
+        self.in_mr_dll_path = QLineEdit("")
+        layout_position.addWidget(self.in_mr_dll_path, 1, 1)
+
+        layout_position.addWidget(QLabel("Board ID:"), 2, 0)
+        self.in_mr_board_id = QLineEdit("0")
+        layout_position.addWidget(self.in_mr_board_id, 2, 1)
+
+        layout_position.addWidget(QLabel("Axis No:"), 3, 0)
+        self.in_mr_axis_no = QLineEdit("1")
+        layout_position.addWidget(self.in_mr_axis_no, 3, 1)
+
+        layout_position.addWidget(QLabel("Command Units / mm:"), 4, 0)
+        self.in_mr_counts_per_mm = QLineEdit("1.0")
+        layout_position.addWidget(self.in_mr_counts_per_mm, 4, 1)
+
+        self.chk_mr_auto_start = QCheckBox("Try sscSystemStart() if the board is not running")
+        layout_position.addWidget(self.chk_mr_auto_start, 5, 0, 1, 2)
+
+        mr_status = "MR-MC240N: optional monitor, Windows + Mitsubishi API DLL required"
+        if os.name != "nt":
+            mr_status = f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}"
+        self.lbl_mr_status = QLabel(mr_status)
+        self.lbl_mr_status.setWordWrap(True)
+        layout_position.addWidget(self.lbl_mr_status, 6, 0, 1, 2)
+
+        group_position.setLayout(layout_position)
+        left_panel.addWidget(group_position)
         
         self.btn_start = QPushButton("Start Test Simulation")
         self.btn_start.clicked.connect(self.toggle_simulation)
@@ -295,7 +405,6 @@ class ClampSimulatorApp(QMainWindow):
         right_panel.addWidget(self.chart, 3)
         
         self.table = QTableWidget(6, 4)
-        self.table.setHorizontalHeaderLabels(["Axis", "Raw Data", "Zero Offset", "Calibrated Value"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for i in range(6):
             self.table.setItem(i, 0, QTableWidgetItem(f"Axis {i+1}"))
@@ -316,6 +425,9 @@ class ClampSimulatorApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_step)
         
+        self.refresh_serial_ports()
+        self.on_position_monitor_toggled(False)
+        self.update_table_headers()
         self.update_chart()
         self.on_input_source_changed(self.source_combo.currentText())
 
@@ -325,9 +437,101 @@ class ClampSimulatorApp(QMainWindow):
     def is_cdaq_mode(self):
         return self.input_source == CDAQ_SOURCE
 
+    def is_fc400_mode(self):
+        return self.input_source == FC400_SOURCE
+
+    def is_live_monitor_mode(self):
+        return self.input_source in {CDAQ_SOURCE, FC400_SOURCE}
+
+    def is_position_monitor_enabled(self):
+        return self.chk_position_monitor.isChecked()
+
+    def get_source_data_unit(self):
+        if self.is_fc400_mode():
+            return self.fc400_device_unit_combo.currentText()
+        return "kgf"
+
+    def convert_value_units(self, value, from_unit, to_unit):
+        if from_unit == to_unit:
+            return value
+        if from_unit == "kgf" and to_unit == "N":
+            return value * 9.80665
+        if from_unit == "N" and to_unit == "kgf":
+            return value / 9.80665
+        raise ValueError(f"지원하지 않는 단위 변환입니다: {from_unit} -> {to_unit}")
+
+    def convert_array_units(self, values, from_unit, to_unit):
+        if from_unit == to_unit:
+            return values
+        factor = self.convert_value_units(1.0, from_unit, to_unit)
+        return values * factor
+
+    def update_table_headers(self):
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Axis",
+                f"Raw Data [{self.data_unit}]",
+                f"Zero Offset [{self.data_unit}]",
+                f"Calibrated Value [{self.unit}]",
+            ]
+        )
+
+    def refresh_serial_ports(self):
+        if not SERIAL_AVAILABLE:
+            self.lbl_fc400_status.setText(f"FC400: pyserial import failed - {SERIAL_IMPORT_ERROR}")
+            return
+
+        ports = list_serial_port_names()
+        if ports and not self.in_fc400_port.text().strip():
+            self.in_fc400_port.setText(ports[0])
+
+        if ports:
+            self.lbl_fc400_status.setText("FC400: detected serial ports - " + ", ".join(ports))
+        else:
+            self.lbl_fc400_status.setText("FC400: no serial ports detected")
+
+    def on_position_monitor_toggled(self, enabled):
+        widgets = [
+            self.in_mr_dll_path,
+            self.in_mr_board_id,
+            self.in_mr_axis_no,
+            self.in_mr_counts_per_mm,
+            self.chk_mr_auto_start,
+        ]
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+        if enabled:
+            if os.name != "nt":
+                self.lbl_mr_status.setText(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
+            else:
+                self.lbl_mr_status.setText(
+                    "MR-MC240N: monitoring enabled, board/API DLL will be opened when live monitoring starts"
+                )
+        else:
+            self.close_position_monitor()
+            if os.name != "nt":
+                self.lbl_mr_status.setText(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
+            else:
+                self.lbl_mr_status.setText("MR-MC240N: disabled")
+
+    def on_source_configuration_changed(self, *_args):
+        previous_source = getattr(self, "input_source", SIMULATION_SOURCE)
+        if self.is_simulating and self.is_live_monitor_mode():
+            self.stop_simulation(completed=False, source_override=previous_source)
+
+        self.data_unit = self.get_source_data_unit()
+        self.raw_data = [0.0] * 6
+        self.sensor_zeros = [0.0] * 6
+        self.update_table_headers()
+        self.update_table()
+        self.update_chart()
+
     def update_start_button_idle_state(self):
         if self.is_cdaq_mode():
             self.btn_start.setText("Start cDAQ Monitoring")
+        elif self.is_fc400_mode():
+            self.btn_start.setText("Start FC400 Monitoring")
         else:
             self.btn_start.setText("Start Test Simulation")
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
@@ -339,6 +543,15 @@ class ClampSimulatorApp(QMainWindow):
 
         self.input_source = source
         use_cdaq = self.is_cdaq_mode()
+        use_fc400 = self.is_fc400_mode()
+        if (
+            use_fc400
+            and previous_source != FC400_SOURCE
+            and self.unit_combo.currentText() == "kgf"
+            and self.fc400_device_unit_combo.currentText() == "N"
+        ):
+            self.unit_combo.setCurrentText("N")
+
         cdaq_widgets = [
             self.in_daq_channel,
             self.in_daq_capacity,
@@ -351,16 +564,50 @@ class ClampSimulatorApp(QMainWindow):
         for widget in cdaq_widgets:
             widget.setEnabled(use_cdaq)
 
+        fc400_widgets = [
+            self.in_fc400_port,
+            self.btn_refresh_serial,
+            self.fc400_baud_combo,
+            self.fc400_parity_combo,
+            self.fc400_stopbits_combo,
+            self.in_fc400_slave_id,
+            self.fc400_weight_mode_combo,
+            self.fc400_device_unit_combo,
+        ]
+        for widget in fc400_widgets:
+            widget.setEnabled(use_fc400)
+
         if use_cdaq:
             self.lbl_status.setText("Status: Ready (cDAQ USB)")
             if not NIDAQMX_AVAILABLE:
                 self.lbl_daq_status.setText(f"cDAQ: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}")
             else:
                 self.refresh_cdaq_devices()
+            self.close_fc400_client()
+        elif use_fc400:
+            self.close_cdaq_task()
+            self.lbl_status.setText("Status: Ready (FC400 RS-485)")
+            if not SERIAL_AVAILABLE:
+                self.lbl_fc400_status.setText(f"FC400: pyserial import failed - {SERIAL_IMPORT_ERROR}")
+            else:
+                self.refresh_serial_ports()
         else:
             self.close_cdaq_task()
+            self.close_fc400_client()
             self.lbl_status.setText("Status: Ready")
-            self.lbl_daq_status.setText("cDAQ: USB input disabled (simulation mode)")
+            self.lbl_daq_status.setText("cDAQ: NI test mode disabled")
+            self.lbl_fc400_status.setText("FC400: RS-485 mode disabled")
+
+        self.data_unit = self.get_source_data_unit()
+        self.raw_data = [0.0] * 6
+        self.sensor_zeros = [0.0] * 6
+        self.latest_live_snapshot = [0.0] * 6
+        self.latest_live_position_mm = None
+        self.latest_live_position_counts = None
+        self.position_zero_offset_mm = 0.0
+        self.update_table_headers()
+        self.update_table()
+        self.update_chart()
 
         self.update_start_button_idle_state()
 
@@ -528,38 +775,214 @@ class ClampSimulatorApp(QMainWindow):
             if opened_here and not self.is_simulating:
                 self.close_cdaq_task()
 
-    def start_cdaq_monitoring(self):
+    def get_fc400_config(self):
+        serial_port = self.in_fc400_port.text().strip()
+        if not serial_port:
+            raise ValueError("FC400 Serial Port를 입력해주세요. 예: COM5 또는 /dev/ttyUSB0")
+
+        slave_id = int(self.in_fc400_slave_id.text())
+        if not 1 <= slave_id <= 247:
+            raise ValueError("FC400 Slave ID는 1~247 범위로 입력해주세요.")
+
+        return {
+            "port": serial_port,
+            "baudrate": int(self.fc400_baud_combo.currentText()),
+            "parity": self.fc400_parity_combo.currentText(),
+            "stopbits": self.fc400_stopbits_combo.currentText(),
+            "slave_id": slave_id,
+            "weight_mode": self.fc400_weight_mode_combo.currentText(),
+            "device_unit": self.fc400_device_unit_combo.currentText(),
+        }
+
+    def open_fc400_client(self):
+        if self.fc400_client is not None:
+            return
+
+        config = self.get_fc400_config()
+        client = FC400ModbusClient(
+            port=config["port"],
+            baudrate=config["baudrate"],
+            parity=config["parity"],
+            stopbits=config["stopbits"],
+            slave_id=config["slave_id"],
+            weight_mode=config["weight_mode"],
+        )
         try:
-            self.open_cdaq_task()
+            client.open()
+        except Exception:
+            client.close()
+            raise
+
+        self.fc400_client = client
+        self.data_unit = config["device_unit"]
+        self.update_table_headers()
+        self.lbl_fc400_status.setText(
+            f"FC400: connected to {config['port']} @ {config['baudrate']} bps, slave {config['slave_id']}"
+        )
+
+    def close_fc400_client(self):
+        if self.fc400_client is None:
+            return
+        try:
+            self.fc400_client.close()
+        finally:
+            self.fc400_client = None
+
+    def read_fc400_measurement(self):
+        opened_here = False
+        if self.fc400_client is None:
+            self.open_fc400_client()
+            opened_here = True
+
+        try:
+            return self.fc400_client.read_measurement()
+        finally:
+            if opened_here and not self.is_simulating:
+                self.close_fc400_client()
+
+    def get_position_monitor_config(self):
+        board_id = int(self.in_mr_board_id.text())
+        axis_number = int(self.in_mr_axis_no.text())
+        counts_per_mm = float(self.in_mr_counts_per_mm.text())
+
+        if not 0 <= board_id <= 3:
+            raise ValueError("MR-MC240N Board ID는 0~3 범위로 입력해주세요.")
+        if axis_number <= 0:
+            raise ValueError("MR-MC240N Axis No는 1 이상이어야 합니다.")
+        if counts_per_mm <= 0:
+            raise ValueError("Command Units / mm는 0보다 커야 합니다.")
+
+        return {
+            "dll_path": self.in_mr_dll_path.text().strip(),
+            "board_id": board_id,
+            "axis_number": axis_number,
+            "counts_per_mm": counts_per_mm,
+            "auto_start_system": self.chk_mr_auto_start.isChecked(),
+        }
+
+    def open_position_monitor(self):
+        if not self.is_position_monitor_enabled():
+            return
+        if self.position_monitor is not None:
+            return
+
+        config = self.get_position_monitor_config()
+        monitor = MrMc240nPositionMonitor(
+            board_id=config["board_id"],
+            axis_number=config["axis_number"],
+            dll_path=config["dll_path"],
+            auto_start_system=config["auto_start_system"],
+        )
+        try:
+            monitor.open()
+        except Exception:
+            monitor.close()
+            raise
+
+        self.position_monitor = monitor
+        self.lbl_mr_status.setText(
+            f"MR-MC240N: board {config['board_id']} axis {config['axis_number']} monitor opened"
+        )
+
+    def close_position_monitor(self):
+        if self.position_monitor is None:
+            return
+        try:
+            self.position_monitor.close()
+        except Exception:
+            pass
+        finally:
+            self.position_monitor = None
+
+    def read_position_feedback(self):
+        if not self.is_position_monitor_enabled():
+            return None, None
+
+        opened_here = False
+        if self.position_monitor is None:
+            self.open_position_monitor()
+            opened_here = True
+
+        try:
+            config = self.get_position_monitor_config()
+            raw_counts = self.position_monitor.read_feedback_position_counts()
+            absolute_position_mm = raw_counts / config["counts_per_mm"]
+            relative_position_mm = absolute_position_mm - self.position_zero_offset_mm
+            return relative_position_mm, raw_counts
+        finally:
+            if opened_here and not self.is_simulating:
+                self.close_position_monitor()
+
+    def get_default_stroke_mm(self):
+        try:
+            return float(self.in_max_len.text())
+        except ValueError:
+            return 0.0
+
+    def start_live_monitoring(self):
+        try:
+            if self.is_cdaq_mode():
+                self.open_cdaq_task()
+                self.data_unit = "kgf"
+            elif self.is_fc400_mode():
+                self.open_fc400_client()
+                self.data_unit = self.get_fc400_config()["device_unit"]
+            if self.is_position_monitor_enabled():
+                self.open_position_monitor()
         except Exception as exc:
             self.close_cdaq_task()
-            QMessageBox.warning(self, "cDAQ Connection Error", f"cDAQ 연결에 실패했습니다.\n{exc}")
+            self.close_fc400_client()
+            self.close_position_monitor()
+            QMessageBox.warning(self, "Hardware Connection Error", f"실장비 연결에 실패했습니다.\n{exc}")
             return
 
         self.is_simulating = True
         self.current_stroke = 0
         self.stroke_data_history = []
+        self.stroke_position_history = []
         self.time_series_data = []
         self.time_elapsed = 0.0
         self.latest_live_snapshot = [0.0] * 6
+        self.latest_live_position_mm = None
+        self.latest_live_position_counts = None
+        self.update_table_headers()
 
         now = datetime.now()
         self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
         self.test_start_display_time = now.strftime('%Y-%m-%d %H:%M:%S')
 
         self.sim_state = "LIVE"
-        self.btn_start.setText("Stop cDAQ Monitoring")
+        if self.is_cdaq_mode():
+            self.btn_start.setText("Stop cDAQ Monitoring")
+        else:
+            self.btn_start.setText("Stop FC400 Monitoring")
         self.btn_start.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
-        self.lbl_status.setText("Status: LIVE (6채널 동일 입력)")
+        self.lbl_status.setText("Status: LIVE (실장비 모니터링)")
         self.timer.start(self.timer_interval)
-        self.cdaq_step()
+        self.live_step()
 
-    def cdaq_step(self):
+    def live_step(self):
         try:
-            load_value = self.read_cdaq_value()
+            if self.is_cdaq_mode():
+                load_value = self.read_cdaq_value()
+                live_stable = None
+            else:
+                measurement = self.read_fc400_measurement()
+                load_value = measurement["value"]
+                live_stable = measurement["stable"]
         except Exception as exc:
-            self.stop_simulation(completed=False, source_override=CDAQ_SOURCE)
-            QMessageBox.critical(self, "cDAQ Read Error", f"로드셀 값을 읽지 못했습니다.\n{exc}")
+            active_source = CDAQ_SOURCE if self.is_cdaq_mode() else FC400_SOURCE
+            self.stop_simulation(completed=False, source_override=active_source)
+            title = "cDAQ Read Error" if self.is_cdaq_mode() else "FC400 Read Error"
+            QMessageBox.critical(self, title, f"하중 값을 읽지 못했습니다.\n{exc}")
+            return
+
+        try:
+            position_mm, position_counts = self.read_position_feedback()
+        except Exception as exc:
+            active_source = CDAQ_SOURCE if self.is_cdaq_mode() else FC400_SOURCE
+            self.stop_simulation(completed=False, source_override=active_source)
+            QMessageBox.critical(self, "MR-MC240N Read Error", f"위치 값을 읽지 못했습니다.\n{exc}")
             return
 
         self.raw_data = [load_value] * 6
@@ -567,58 +990,90 @@ class ClampSimulatorApp(QMainWindow):
         self.update_chart()
 
         self.time_elapsed += self.timer_interval / 1000.0
-        current_calibrated_kgf = [max(0, self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
-        self.latest_live_snapshot = current_calibrated_kgf.copy()
+        current_calibrated_base = [max(0, self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
+        self.latest_live_snapshot = current_calibrated_base.copy()
+        self.latest_live_position_mm = position_mm
+        self.latest_live_position_counts = position_counts
 
-        current_calibrated_display = current_calibrated_kgf.copy()
-        if self.unit == "N":
-            current_calibrated_display = [v * 9.80665 for v in current_calibrated_display]
+        current_calibrated_display = [
+            self.convert_value_units(value, self.data_unit, self.unit)
+            for value in current_calibrated_base
+        ]
 
         log_row = {
             'Time [sec]': round(self.time_elapsed, 1),
             'Stroke': 1,
             'State': 'LIVE'
         }
+        if position_mm is not None:
+            log_row['Position [mm]'] = round(position_mm, 3)
+        if position_counts is not None:
+            log_row['Position Raw [cmd]'] = int(position_counts)
+        if live_stable is not None:
+            log_row['Stable'] = int(bool(live_stable))
+
         for i in range(6):
-            log_row[f'Axis {i+1} Raw'] = round(self.raw_data[i], 2)
+            log_row[f'Axis {i+1} Raw [{self.data_unit}]'] = round(self.raw_data[i], 3)
         for i in range(6):
-            log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated_display[i], 2)
+            log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated_display[i], 3)
         self.time_series_data.append(log_row)
 
-        self.lbl_status.setText(f"Status: LIVE ({current_calibrated_display[0]:.2f} {self.unit}, 6채널 동일)")
+        source_name = "cDAQ" if self.is_cdaq_mode() else "FC400"
+        if position_mm is not None:
+            self.lbl_status.setText(
+                f"Status: LIVE ({source_name} {current_calibrated_display[0]:.2f} {self.unit}, Stroke {position_mm:.3f} mm)"
+            )
+        else:
+            self.lbl_status.setText(
+                f"Status: LIVE ({source_name} {current_calibrated_display[0]:.2f} {self.unit}, 6채널 동일)"
+            )
 
     def timer_step(self):
-        if self.is_cdaq_mode():
-            self.cdaq_step()
+        if self.is_live_monitor_mode():
+            self.live_step()
         else:
             self.simulation_step()
 
     def ensure_export_snapshot(self):
         if self.stroke_data_history:
             return
-        if self.is_cdaq_mode() and len(self.time_series_data) > 0:
+        if self.is_live_monitor_mode() and len(self.time_series_data) > 0:
             self.stroke_data_history = [self.latest_live_snapshot.copy()]
+            snapshot_mm = (
+                self.latest_live_position_mm
+                if self.latest_live_position_mm is not None
+                else self.get_default_stroke_mm()
+            )
+            self.stroke_position_history = [snapshot_mm]
 
     def change_unit(self, unit):
         self.unit = unit
+        self.update_table_headers()
         self.update_table()
         self.update_chart()
 
     def zero_sensors(self):
         # 모든 물리적 데이터, 영점 기준, 그리고 이전 테스트 기록과 시계열 데이터 완전히 리셋
         self.stroke_data_history = []
+        self.stroke_position_history = []
         self.time_series_data = []
         self.time_elapsed = 0.0
         self.latest_live_snapshot = [0.0] * 6
+        self.latest_live_position_mm = None
+        self.latest_live_position_counts = None
         
         self.test_start_ts = None
         self.test_start_display_time = None
 
-        if self.is_cdaq_mode():
+        if self.is_live_monitor_mode():
             try:
-                current_value = self.read_cdaq_value()
+                if self.is_cdaq_mode():
+                    current_value = self.read_cdaq_value()
+                else:
+                    current_value = self.read_fc400_measurement()["value"]
             except Exception as exc:
-                QMessageBox.warning(self, "cDAQ Zero Error", f"로드셀 영점 설정에 실패했습니다.\n{exc}")
+                title = "cDAQ Zero Error" if self.is_cdaq_mode() else "FC400 Zero Error"
+                QMessageBox.warning(self, title, f"로드셀 영점 설정에 실패했습니다.\n{exc}")
                 return
 
             self.raw_data = [current_value] * 6
@@ -626,17 +1081,22 @@ class ClampSimulatorApp(QMainWindow):
             self.sim_current_load = 0.0
             status_text = "Status: Ready (Load Cell Tared)"
             message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
+
+            if self.is_position_monitor_enabled():
+                try:
+                    current_position_mm, current_position_counts = self.read_position_feedback()
+                    self.position_zero_offset_mm += current_position_mm if current_position_mm is not None else 0.0
+                    self.latest_live_position_mm = 0.0
+                    self.latest_live_position_counts = current_position_counts
+                except Exception as exc:
+                    self.lbl_mr_status.setText(f"MR-MC240N: 위치 영점은 유지됨 - {exc}")
         else:
             self.raw_data = [0.0] * 6
             self.sensor_zeros = [0.0] * 6
             self.sim_current_load = 0.0
+            self.position_zero_offset_mm = 0.0
             status_text = "Status: Ready (Data Reset)"
             message_text = "센서 영점 맞춤 및 이전 데이터 초기화가 완료되었습니다."
-        
-        for i in range(6):
-            self.table.setItem(i, 1, QTableWidgetItem("0.00"))
-            self.table.setItem(i, 2, QTableWidgetItem("0.00"))
-            self.table.setItem(i, 3, QTableWidgetItem("0.00"))
 
         self.lbl_status.setText(status_text)
         self.update_table()
@@ -645,17 +1105,19 @@ class ClampSimulatorApp(QMainWindow):
 
     def update_table(self):
         for i in range(6):
-            self.table.setItem(i, 1, QTableWidgetItem(f"{self.raw_data[i]:.2f}"))
-            self.table.setItem(i, 2, QTableWidgetItem(f"{self.sensor_zeros[i]:.2f}"))
-            calibrated = self.raw_data[i] - self.sensor_zeros[i]
-            display_val = calibrated * 9.80665 if self.unit == "N" else calibrated
-            self.table.setItem(i, 3, QTableWidgetItem(f"{display_val:.2f}"))
+            raw_display = self.raw_data[i]
+            zero_display = self.sensor_zeros[i]
+            calibrated_base = self.raw_data[i] - self.sensor_zeros[i]
+            calibrated_display = self.convert_value_units(calibrated_base, self.data_unit, self.unit)
+            self.table.setItem(i, 1, QTableWidgetItem(f"{raw_display:.2f}"))
+            self.table.setItem(i, 2, QTableWidgetItem(f"{zero_display:.2f}"))
+            self.table.setItem(i, 3, QTableWidgetItem(f"{calibrated_display:.2f}"))
 
     def get_calibrated_data(self):
         data = []
         for i in range(6):
-            calibrated = self.raw_data[i] - self.sensor_zeros[i]
-            display_val = calibrated * 9.80665 if self.unit == "N" else calibrated
+            calibrated_base = self.raw_data[i] - self.sensor_zeros[i]
+            display_val = self.convert_value_units(calibrated_base, self.data_unit, self.unit)
             data.append(max(0, display_val))
         return data
 
@@ -666,16 +1128,21 @@ class ClampSimulatorApp(QMainWindow):
 
     def stop_simulation(self, completed=False, source_override=None):
         active_source = source_override if source_override is not None else self.input_source
-        using_cdaq = active_source == CDAQ_SOURCE
+        using_live_hardware = active_source in {CDAQ_SOURCE, FC400_SOURCE}
         self.is_simulating = False
         self.sim_state = "IDLE"
         self.timer.stop()
         self.update_start_button_idle_state()
 
-        if using_cdaq:
+        if using_live_hardware:
             self.close_cdaq_task()
+            self.close_fc400_client()
+            self.close_position_monitor()
             self.ensure_export_snapshot()
-            self.lbl_status.setText("Status: cDAQ Monitoring Stopped")
+            if active_source == CDAQ_SOURCE:
+                self.lbl_status.setText("Status: cDAQ Monitoring Stopped")
+            else:
+                self.lbl_status.setText("Status: FC400 Monitoring Stopped")
             self.update_table()
             self.update_chart()
             return
@@ -691,8 +1158,8 @@ class ClampSimulatorApp(QMainWindow):
 
     def toggle_simulation(self):
         if not self.is_simulating:
-            if self.is_cdaq_mode():
-                self.start_cdaq_monitoring()
+            if self.is_live_monitor_mode():
+                self.start_live_monitoring()
                 return
 
             try:
@@ -705,11 +1172,17 @@ class ClampSimulatorApp(QMainWindow):
 
             self.is_simulating = True
             self.current_stroke = 0
+            self.data_unit = "kgf"
             
             # 새 테스트 시작 시 이력 리셋
             self.stroke_data_history = []
+            self.stroke_position_history = []
             self.time_series_data = []
             self.time_elapsed = 0.0
+            self.latest_live_position_mm = None
+            self.latest_live_position_counts = None
+            self.position_zero_offset_mm = 0.0
+            self.update_table_headers()
             
             now = datetime.now()
             self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
@@ -739,6 +1212,7 @@ class ClampSimulatorApp(QMainWindow):
             if self.hold_ticks == int((self.hold_time * 1000) / self.timer_interval):
                 calibrated = [(self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
                 self.stroke_data_history.append(calibrated)
+                self.stroke_position_history.append(self.get_default_stroke_mm())
             self.hold_ticks -= 1
             if self.hold_ticks <= 0:
                 self.sim_state = "RELEASING"
@@ -795,6 +1269,11 @@ class ClampSimulatorApp(QMainWindow):
         if self.is_simulating:
             self.lbl_status.setText(f"Status: {self.sim_state} ({self.current_stroke} / {self.target_strokes} Strokes)")
 
+    def get_stroke_position_value(self, index):
+        if index < len(self.stroke_position_history):
+            return self.stroke_position_history[index]
+        return self.get_default_stroke_mm()
+
     def export_csv(self):
         self.ensure_export_snapshot()
         if len(self.stroke_data_history) == 0:
@@ -807,13 +1286,12 @@ class ClampSimulatorApp(QMainWindow):
         
         if file_name:
             all_data = np.array(self.stroke_data_history)
-            if self.unit == "N":
-                all_data = all_data * 9.80665
+            all_data = self.convert_array_units(all_data, self.data_unit, self.unit)
 
             # ============ 1. 상단 요약본 (스트로크 통계) ============
             records = []
             for idx, stroke_data in enumerate(all_data):
-                row_dict = {'No': f'Stroke {idx + 1}', 'Stroke [mm]': self.in_max_len.text()}
+                row_dict = {'No': f'Stroke {idx + 1}', 'Stroke [mm]': round(self.get_stroke_position_value(idx), 3)}
                 for axis_idx in range(6):
                     row_dict[f'Axis {axis_idx + 1} [{self.unit}]'] = round(stroke_data[axis_idx], 2)
                 row_dict[f'Average [{self.unit}]'] = round(np.mean(stroke_data), 2)
@@ -827,10 +1305,10 @@ class ClampSimulatorApp(QMainWindow):
             avg_vals = np.mean(all_data, axis=0)
 
             stat_rows = [
-                {'No': 'Min', 'Stroke [mm]': self.in_max_len.text()},
-                {'No': 'Max', 'Stroke [mm]': self.in_max_len.text()},
+                {'No': 'Min', 'Stroke [mm]': round(np.min(self.stroke_position_history), 3) if self.stroke_position_history else self.get_default_stroke_mm()},
+                {'No': 'Max', 'Stroke [mm]': round(np.max(self.stroke_position_history), 3) if self.stroke_position_history else self.get_default_stroke_mm()},
                 {'No': 'R (Range)', 'Stroke [mm]': '0.00'},
-                {'No': 'Ave (Total)', 'Stroke [mm]': self.in_max_len.text()}
+                {'No': 'Ave (Total)', 'Stroke [mm]': round(np.mean(self.stroke_position_history), 3) if self.stroke_position_history else self.get_default_stroke_mm()}
             ]
 
             for i in range(6):
@@ -944,14 +1422,13 @@ class ClampSimulatorApp(QMainWindow):
         ax_table.axis('off')
         
         all_data = np.array(self.stroke_data_history)
-        if self.unit == "N":
-            all_data = all_data * 9.80665
+        all_data = self.convert_array_units(all_data, self.data_unit, self.unit)
             
         table_data = [['No', 'Stroke\n[mm]', 'Axis 1', 'Axis 2', 'Axis 3', 
                        'Axis 4', 'Axis 5', 'Axis 6', f'Average']]
         
         for idx, stroke_data in enumerate(all_data):
-            stroke_mm = self.in_max_len.text()
+            stroke_mm = f"{self.get_stroke_position_value(idx):.3f}"
             avg = np.mean(stroke_data)
             row = [str(idx+1), stroke_mm] + [f'{v:.2f}' for v in stroke_data] + [f'{avg:.2f}']
             table_data.append(row)
@@ -963,11 +1440,14 @@ class ClampSimulatorApp(QMainWindow):
         max_vals = np.max(all_data, axis=0)
         range_vals = max_vals - min_vals
         avg_vals = np.mean(all_data, axis=0)
+        min_stroke = round(np.min(self.stroke_position_history), 3) if self.stroke_position_history else self.get_default_stroke_mm()
+        max_stroke = round(np.max(self.stroke_position_history), 3) if self.stroke_position_history else self.get_default_stroke_mm()
+        avg_stroke = round(np.mean(self.stroke_position_history), 3) if self.stroke_position_history else self.get_default_stroke_mm()
         
-        table_data.append(['Min', self.in_max_len.text()] + [f'{v:.2f}' for v in min_vals] + [f'{np.min(all_data):.2f}'])
-        table_data.append(['Max', self.in_max_len.text()] + [f'{v:.2f}' for v in max_vals] + [f'{np.max(all_data):.2f}'])
+        table_data.append(['Min', f'{min_stroke:.3f}'] + [f'{v:.2f}' for v in min_vals] + [f'{np.min(all_data):.2f}'])
+        table_data.append(['Max', f'{max_stroke:.3f}'] + [f'{v:.2f}' for v in max_vals] + [f'{np.max(all_data):.2f}'])
         table_data.append(['R', '0.00'] + [f'{v:.2f}' for v in range_vals] + [f'{np.max(range_vals):.2f}'])
-        table_data.append(['Ave', self.in_max_len.text()] + [f'{v:.2f}' for v in avg_vals] + [f'{np.mean(all_data):.2f}'])
+        table_data.append(['Ave', f'{avg_stroke:.3f}'] + [f'{v:.2f}' for v in avg_vals] + [f'{np.mean(all_data):.2f}'])
         
         data_table = ax_table.table(cellText=table_data, cellLoc='center', loc='center',
                                     colWidths=[0.06, 0.1, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12])
@@ -1038,6 +1518,8 @@ class ClampSimulatorApp(QMainWindow):
 
     def closeEvent(self, event):
         self.close_cdaq_task()
+        self.close_fc400_client()
+        self.close_position_monitor()
         super().closeEvent(event)
 
 if __name__ == '__main__':
