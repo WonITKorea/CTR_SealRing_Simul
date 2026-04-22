@@ -15,6 +15,37 @@ import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
 import platform
 
+try:
+    import nidaqmx
+    from nidaqmx.system import System
+    from nidaqmx.constants import (
+        AcquisitionType,
+        BridgeConfiguration,
+        BridgeElectricalUnits,
+        BridgePhysicalUnits,
+        ExcitationSource,
+        ForceUnits,
+        READ_ALL_AVAILABLE,
+    )
+    NIDAQMX_AVAILABLE = True
+    NIDAQMX_IMPORT_ERROR = ""
+except Exception as exc:
+    nidaqmx = None
+    System = None
+    AcquisitionType = None
+    BridgeConfiguration = None
+    BridgeElectricalUnits = None
+    BridgePhysicalUnits = None
+    ExcitationSource = None
+    ForceUnits = None
+    READ_ALL_AVAILABLE = None
+    NIDAQMX_AVAILABLE = False
+    NIDAQMX_IMPORT_ERROR = str(exc)
+
+SIMULATION_SOURCE = "Simulation"
+CDAQ_SOURCE = "cDAQ USB (1ch -> 6ch)"
+DEFAULT_NI_9237_SAMPLE_RATE = 12_800_000.0 / 256.0 / 31.0
+
 # 한글 폰트 강제 로드 (OS 자동 인식)
 font_path = None
 if platform.system() == 'Windows':
@@ -98,9 +129,12 @@ class ClampSimulatorApp(QMainWindow):
         self.hold_ticks = 0
         self.sim_current_load = 0.0
         self.timer_interval = 100 
+        self.input_source = SIMULATION_SOURCE
         
         self.sensor_zeros = [0.0] * 6
         self.raw_data = [0.0] * 6
+        self.latest_live_snapshot = [0.0] * 6
+        self.cdaq_task = None
         
         # 데이터 저장소
         self.stroke_data_history = []  # 각 스트로크 최종 결과 저장
@@ -199,6 +233,53 @@ class ClampSimulatorApp(QMainWindow):
         layout_settings.addWidget(self.btn_zero)
         group_settings.setLayout(layout_settings)
         left_panel.addWidget(group_settings)
+
+        group_daq = QGroupBox("cDAQ USB Input")
+        layout_daq = QGridLayout()
+
+        layout_daq.addWidget(QLabel("Input Source:"), 0, 0)
+        self.source_combo = QComboBox()
+        self.source_combo.addItems([SIMULATION_SOURCE, CDAQ_SOURCE])
+        self.source_combo.currentTextChanged.connect(self.on_input_source_changed)
+        layout_daq.addWidget(self.source_combo, 0, 1)
+
+        layout_daq.addWidget(QLabel("Physical Channel:"), 1, 0)
+        self.in_daq_channel = QLineEdit("cDAQ1Mod1/ai0")
+        layout_daq.addWidget(self.in_daq_channel, 1, 1)
+
+        layout_daq.addWidget(QLabel("Rated Load [kgf]:"), 2, 0)
+        self.in_daq_capacity = QLineEdit("100.0")
+        layout_daq.addWidget(self.in_daq_capacity, 2, 1)
+
+        layout_daq.addWidget(QLabel("Sensitivity [mV/V]:"), 3, 0)
+        self.in_daq_sensitivity = QLineEdit("2.0")
+        layout_daq.addWidget(self.in_daq_sensitivity, 3, 1)
+
+        layout_daq.addWidget(QLabel("Bridge Resistance [Ohm]:"), 4, 0)
+        self.in_daq_bridge_res = QLineEdit("350")
+        layout_daq.addWidget(self.in_daq_bridge_res, 4, 1)
+
+        layout_daq.addWidget(QLabel("Excitation [V]:"), 5, 0)
+        self.in_daq_excitation = QLineEdit("5.0")
+        layout_daq.addWidget(self.in_daq_excitation, 5, 1)
+
+        layout_daq.addWidget(QLabel("Sample Rate [S/s]:"), 6, 0)
+        self.in_daq_sample_rate = QLineEdit(f"{DEFAULT_NI_9237_SAMPLE_RATE:.3f}")
+        layout_daq.addWidget(self.in_daq_sample_rate, 6, 1)
+
+        self.btn_refresh_daq = QPushButton("Refresh NI Devices")
+        self.btn_refresh_daq.clicked.connect(self.refresh_cdaq_devices)
+        layout_daq.addWidget(self.btn_refresh_daq, 7, 0, 1, 2)
+
+        init_daq_status = "cDAQ: select USB mode to scan devices"
+        if not NIDAQMX_AVAILABLE:
+            init_daq_status = f"cDAQ: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
+        self.lbl_daq_status = QLabel(init_daq_status)
+        self.lbl_daq_status.setWordWrap(True)
+        layout_daq.addWidget(self.lbl_daq_status, 8, 0, 1, 2)
+
+        group_daq.setLayout(layout_daq)
+        left_panel.addWidget(group_daq)
         
         self.btn_start = QPushButton("Start Test Simulation")
         self.btn_start.clicked.connect(self.toggle_simulation)
@@ -233,12 +314,290 @@ class ClampSimulatorApp(QMainWindow):
         
         main_layout.addLayout(right_panel, 3)
         self.timer = QTimer()
-        self.timer.timeout.connect(self.simulation_step)
+        self.timer.timeout.connect(self.timer_step)
         
         self.update_chart()
+        self.on_input_source_changed(self.source_combo.currentText())
 
     def update_camera_focus(self, size):
         self.lbl_camera.setText(f"Camera Focus Action: Adjusted to {size}")
+
+    def is_cdaq_mode(self):
+        return self.input_source == CDAQ_SOURCE
+
+    def update_start_button_idle_state(self):
+        if self.is_cdaq_mode():
+            self.btn_start.setText("Start cDAQ Monitoring")
+        else:
+            self.btn_start.setText("Start Test Simulation")
+        self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
+
+    def on_input_source_changed(self, source):
+        previous_source = getattr(self, "input_source", SIMULATION_SOURCE)
+        if self.is_simulating:
+            self.stop_simulation(completed=False, source_override=previous_source)
+
+        self.input_source = source
+        use_cdaq = self.is_cdaq_mode()
+        cdaq_widgets = [
+            self.in_daq_channel,
+            self.in_daq_capacity,
+            self.in_daq_sensitivity,
+            self.in_daq_bridge_res,
+            self.in_daq_excitation,
+            self.in_daq_sample_rate,
+            self.btn_refresh_daq,
+        ]
+        for widget in cdaq_widgets:
+            widget.setEnabled(use_cdaq)
+
+        if use_cdaq:
+            self.lbl_status.setText("Status: Ready (cDAQ USB)")
+            if not NIDAQMX_AVAILABLE:
+                self.lbl_daq_status.setText(f"cDAQ: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}")
+            else:
+                self.refresh_cdaq_devices()
+        else:
+            self.close_cdaq_task()
+            self.lbl_status.setText("Status: Ready")
+            self.lbl_daq_status.setText("cDAQ: USB input disabled (simulation mode)")
+
+        self.update_start_button_idle_state()
+
+    def refresh_cdaq_devices(self):
+        if not NIDAQMX_AVAILABLE:
+            self.lbl_daq_status.setText(f"cDAQ: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}")
+            return
+
+        try:
+            device_summaries = []
+            first_ai_channel = None
+            for device in System.local().devices:
+                try:
+                    ai_channels = device.ai_physical_chans.channel_names
+                except Exception:
+                    ai_channels = []
+
+                if not ai_channels:
+                    continue
+
+                product_type = ""
+                try:
+                    product_type = device.product_type
+                except Exception:
+                    product_type = "NI Device"
+
+                device_summaries.append(f"{device.name} ({product_type})")
+                if first_ai_channel is None:
+                    first_ai_channel = ai_channels[0]
+
+            current_channel = self.in_daq_channel.text().strip()
+            if first_ai_channel and current_channel in {"", "cDAQ1Mod1/ai0"}:
+                self.in_daq_channel.setText(first_ai_channel)
+
+            if device_summaries:
+                self.lbl_daq_status.setText("cDAQ: " + ", ".join(device_summaries))
+            else:
+                self.lbl_daq_status.setText("cDAQ: no NI analog-input device found")
+        except Exception as exc:
+            self.lbl_daq_status.setText(f"cDAQ: device scan failed - {exc}")
+
+    def get_cdaq_config(self):
+        physical_channel = self.in_daq_channel.text().strip()
+        if not physical_channel:
+            raise ValueError("Physical Channel을 입력해주세요. 예: cDAQ1Mod1/ai0")
+
+        rated_load_kgf = float(self.in_daq_capacity.text())
+        sensitivity_mv_v = float(self.in_daq_sensitivity.text())
+        bridge_resistance = float(self.in_daq_bridge_res.text())
+        excitation_voltage = float(self.in_daq_excitation.text())
+        sample_rate_hz = float(self.in_daq_sample_rate.text())
+
+        if rated_load_kgf <= 0:
+            raise ValueError("Rated Load는 0보다 커야 합니다.")
+        if sensitivity_mv_v <= 0:
+            raise ValueError("Sensitivity는 0보다 커야 합니다.")
+        if bridge_resistance <= 0:
+            raise ValueError("Bridge Resistance는 0보다 커야 합니다.")
+        if excitation_voltage <= 0:
+            raise ValueError("Excitation은 0보다 커야 합니다.")
+        if sample_rate_hz <= 0:
+            raise ValueError("Sample Rate는 0보다 커야 합니다.")
+
+        return {
+            "physical_channel": physical_channel,
+            "rated_load_kgf": rated_load_kgf,
+            "sensitivity_mv_v": sensitivity_mv_v,
+            "bridge_resistance": bridge_resistance,
+            "excitation_voltage": excitation_voltage,
+            "sample_rate_hz": sample_rate_hz,
+        }
+
+    def open_cdaq_task(self):
+        if self.cdaq_task is not None:
+            return
+
+        if not NIDAQMX_AVAILABLE:
+            raise RuntimeError(f"nidaqmx를 불러오지 못했습니다: {NIDAQMX_IMPORT_ERROR}")
+
+        config = self.get_cdaq_config()
+        task = nidaqmx.Task()
+        try:
+            task.ai_channels.add_ai_force_bridge_two_point_lin_chan(
+                config["physical_channel"],
+                min_val=-config["rated_load_kgf"],
+                max_val=config["rated_load_kgf"],
+                units=ForceUnits.KILOGRAM_FORCE,
+                bridge_config=BridgeConfiguration.FULL_BRIDGE,
+                voltage_excit_source=ExcitationSource.INTERNAL,
+                voltage_excit_val=config["excitation_voltage"],
+                nominal_bridge_resistance=config["bridge_resistance"],
+                first_electrical_val=0.0,
+                second_electrical_val=config["sensitivity_mv_v"],
+                electrical_units=BridgeElectricalUnits.MILLIVOLTS_PER_VOLT,
+                first_physical_val=0.0,
+                second_physical_val=config["rated_load_kgf"],
+                physical_units=BridgePhysicalUnits.KILOGRAM_FORCE,
+            )
+            # NI 9237 같은 delta-sigma C Series 모듈은 On Demand 읽기 대신
+            # 하드웨어 타이밍된 샘플 클록을 명시해야 합니다.
+            task.timing.cfg_samp_clk_timing(
+                config["sample_rate_hz"],
+                sample_mode=AcquisitionType.CONTINUOUS,
+                samps_per_chan=max(int(config["sample_rate_hz"] * 2), 1000),
+            )
+            task.in_stream.read_all_avail_samp = True
+            task.start()
+        except Exception:
+            task.close()
+            raise
+
+        self.cdaq_task = task
+        actual_sample_rate = task.timing.samp_clk_rate
+        self.in_daq_sample_rate.setText(f"{actual_sample_rate:.3f}")
+        self.lbl_daq_status.setText(
+            f"cDAQ: connected to {config['physical_channel']} @ {actual_sample_rate:.3f} S/s"
+        )
+
+    def close_cdaq_task(self):
+        if self.cdaq_task is None:
+            return
+
+        try:
+            self.cdaq_task.stop()
+        except Exception:
+            pass
+
+        try:
+            self.cdaq_task.close()
+        except Exception:
+            pass
+
+        self.cdaq_task = None
+
+    def read_cdaq_value(self):
+        opened_here = False
+        if self.cdaq_task is None:
+            self.open_cdaq_task()
+            opened_here = True
+
+        try:
+            available_samples = self.cdaq_task.in_stream.avail_samp_per_chan
+            if available_samples < 1:
+                value = self.cdaq_task.read(number_of_samples_per_channel=1, timeout=1.0)
+            else:
+                value = self.cdaq_task.read(
+                    number_of_samples_per_channel=READ_ALL_AVAILABLE,
+                    timeout=1.0,
+                )
+            if isinstance(value, np.ndarray):
+                if value.size == 0:
+                    raise RuntimeError("cDAQ 버퍼에 읽을 샘플이 없습니다.")
+                return float(value[-1])
+            if isinstance(value, (list, tuple)):
+                if len(value) == 0:
+                    raise RuntimeError("cDAQ 버퍼에 읽을 샘플이 없습니다.")
+                last_value = value[-1]
+                if isinstance(last_value, (list, tuple, np.ndarray)):
+                    if len(last_value) == 0:
+                        raise RuntimeError("cDAQ 버퍼에 읽을 샘플이 없습니다.")
+                    last_value = last_value[-1]
+                return float(last_value)
+            return float(value)
+        finally:
+            if opened_here and not self.is_simulating:
+                self.close_cdaq_task()
+
+    def start_cdaq_monitoring(self):
+        try:
+            self.open_cdaq_task()
+        except Exception as exc:
+            self.close_cdaq_task()
+            QMessageBox.warning(self, "cDAQ Connection Error", f"cDAQ 연결에 실패했습니다.\n{exc}")
+            return
+
+        self.is_simulating = True
+        self.current_stroke = 0
+        self.stroke_data_history = []
+        self.time_series_data = []
+        self.time_elapsed = 0.0
+        self.latest_live_snapshot = [0.0] * 6
+
+        now = datetime.now()
+        self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
+        self.test_start_display_time = now.strftime('%Y-%m-%d %H:%M:%S')
+
+        self.sim_state = "LIVE"
+        self.btn_start.setText("Stop cDAQ Monitoring")
+        self.btn_start.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
+        self.lbl_status.setText("Status: LIVE (6채널 동일 입력)")
+        self.timer.start(self.timer_interval)
+        self.cdaq_step()
+
+    def cdaq_step(self):
+        try:
+            load_value = self.read_cdaq_value()
+        except Exception as exc:
+            self.stop_simulation(completed=False, source_override=CDAQ_SOURCE)
+            QMessageBox.critical(self, "cDAQ Read Error", f"로드셀 값을 읽지 못했습니다.\n{exc}")
+            return
+
+        self.raw_data = [load_value] * 6
+        self.update_table()
+        self.update_chart()
+
+        self.time_elapsed += self.timer_interval / 1000.0
+        current_calibrated_kgf = [max(0, self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
+        self.latest_live_snapshot = current_calibrated_kgf.copy()
+
+        current_calibrated_display = current_calibrated_kgf.copy()
+        if self.unit == "N":
+            current_calibrated_display = [v * 9.80665 for v in current_calibrated_display]
+
+        log_row = {
+            'Time [sec]': round(self.time_elapsed, 1),
+            'Stroke': 1,
+            'State': 'LIVE'
+        }
+        for i in range(6):
+            log_row[f'Axis {i+1} Raw'] = round(self.raw_data[i], 2)
+        for i in range(6):
+            log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated_display[i], 2)
+        self.time_series_data.append(log_row)
+
+        self.lbl_status.setText(f"Status: LIVE ({current_calibrated_display[0]:.2f} {self.unit}, 6채널 동일)")
+
+    def timer_step(self):
+        if self.is_cdaq_mode():
+            self.cdaq_step()
+        else:
+            self.simulation_step()
+
+    def ensure_export_snapshot(self):
+        if self.stroke_data_history:
+            return
+        if self.is_cdaq_mode() and len(self.time_series_data) > 0:
+            self.stroke_data_history = [self.latest_live_snapshot.copy()]
 
     def change_unit(self, unit):
         self.unit = unit
@@ -247,25 +606,42 @@ class ClampSimulatorApp(QMainWindow):
 
     def zero_sensors(self):
         # 모든 물리적 데이터, 영점 기준, 그리고 이전 테스트 기록과 시계열 데이터 완전히 리셋
-        self.raw_data = [0.0] * 6
-        self.sensor_zeros = [0.0] * 6
-        self.sim_current_load = 0.0
-        
         self.stroke_data_history = []
         self.time_series_data = []
         self.time_elapsed = 0.0
+        self.latest_live_snapshot = [0.0] * 6
         
         self.test_start_ts = None
         self.test_start_display_time = None
+
+        if self.is_cdaq_mode():
+            try:
+                current_value = self.read_cdaq_value()
+            except Exception as exc:
+                QMessageBox.warning(self, "cDAQ Zero Error", f"로드셀 영점 설정에 실패했습니다.\n{exc}")
+                return
+
+            self.raw_data = [current_value] * 6
+            self.sensor_zeros = self.raw_data.copy()
+            self.sim_current_load = 0.0
+            status_text = "Status: Ready (Load Cell Tared)"
+            message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
+        else:
+            self.raw_data = [0.0] * 6
+            self.sensor_zeros = [0.0] * 6
+            self.sim_current_load = 0.0
+            status_text = "Status: Ready (Data Reset)"
+            message_text = "센서 영점 맞춤 및 이전 데이터 초기화가 완료되었습니다."
         
         for i in range(6):
             self.table.setItem(i, 1, QTableWidgetItem("0.00"))
             self.table.setItem(i, 2, QTableWidgetItem("0.00"))
             self.table.setItem(i, 3, QTableWidgetItem("0.00"))
 
-        self.lbl_status.setText("Status: Ready (Data Reset)")
+        self.lbl_status.setText(status_text)
+        self.update_table()
         self.update_chart()
-        QMessageBox.information(self, "Zeroed", "센서 영점 맞춤 및 이전 데이터 초기화가 완료되었습니다.")
+        QMessageBox.information(self, "Zeroed", message_text)
 
     def update_table(self):
         for i in range(6):
@@ -288,12 +664,22 @@ class ClampSimulatorApp(QMainWindow):
         interp = self.interp_combo.currentText()
         self.chart.plot_data(data, interpolate_type=interp, unit=self.unit)
 
-    def stop_simulation(self, completed=False):
+    def stop_simulation(self, completed=False, source_override=None):
+        active_source = source_override if source_override is not None else self.input_source
+        using_cdaq = active_source == CDAQ_SOURCE
         self.is_simulating = False
         self.sim_state = "IDLE"
-        self.btn_start.setText("Start Test Simulation")
-        self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
         self.timer.stop()
+        self.update_start_button_idle_state()
+
+        if using_cdaq:
+            self.close_cdaq_task()
+            self.ensure_export_snapshot()
+            self.lbl_status.setText("Status: cDAQ Monitoring Stopped")
+            self.update_table()
+            self.update_chart()
+            return
+
         if completed:
             if len(self.stroke_data_history) > 0:
                 self.raw_data = [val + self.sensor_zeros[i] for i, val in enumerate(self.stroke_data_history[-1])]
@@ -305,6 +691,10 @@ class ClampSimulatorApp(QMainWindow):
 
     def toggle_simulation(self):
         if not self.is_simulating:
+            if self.is_cdaq_mode():
+                self.start_cdaq_monitoring()
+                return
+
             try:
                 self.target_strokes = int(self.in_strokes.text())
                 self.target_load = float(self.in_load.text())
@@ -406,6 +796,7 @@ class ClampSimulatorApp(QMainWindow):
             self.lbl_status.setText(f"Status: {self.sim_state} ({self.current_stroke} / {self.target_strokes} Strokes)")
 
     def export_csv(self):
+        self.ensure_export_snapshot()
         if len(self.stroke_data_history) == 0:
             QMessageBox.warning(self, "No Data", "저장할 테스트 데이터가 없습니다.")
             return
@@ -472,6 +863,7 @@ class ClampSimulatorApp(QMainWindow):
             QMessageBox.information(self, "Saved", f"CSV 파일이 성공적으로 저장되었습니다.\n{file_name}")
 
     def export_pdf(self):
+        self.ensure_export_snapshot()
         if len(self.stroke_data_history) == 0:
             QMessageBox.warning(self, "No Data", "저장할 테스트 데이터가 없습니다.")
             return
@@ -643,6 +1035,10 @@ class ClampSimulatorApp(QMainWindow):
         plt.close(fig)
         
         QMessageBox.information(self, "Saved", f"A4 성적서가 성공적으로 저장되었습니다.\n{file_name}")
+
+    def closeEvent(self, event):
+        self.close_cdaq_task()
+        super().closeEvent(event)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
