@@ -482,8 +482,10 @@ class ClampSimulatorApp(QMainWindow):
             return
 
         ports = list_serial_port_names()
-        if ports and not self.in_fc400_port.text().strip():
-            self.in_fc400_port.setText(ports[0])
+        preferred_ports = list_serial_port_names(include_low_confidence=False)
+        current_port = self.in_fc400_port.text().strip()
+        if preferred_ports and not current_port:
+            self.in_fc400_port.setText(preferred_ports[0])
 
         if ports:
             self.lbl_fc400_status.setText("FC400: detected serial ports - " + ", ".join(ports))

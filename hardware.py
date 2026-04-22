@@ -1,6 +1,7 @@
 import ctypes
 import os
 import platform
+import re
 import struct
 
 try:
@@ -20,10 +21,63 @@ FC400_NET_MODE = "Net"
 MR_MC240N_WINDOWS_ONLY_MESSAGE = "MR-MC240N position board monitoring is supported only on Windows."
 
 
-def list_serial_port_names():
+def list_serial_port_names(include_low_confidence=True):
     if not SERIAL_AVAILABLE:
         return []
-    return sorted(port.device for port in list_ports.comports())
+
+    ports = list(list_ports.comports())
+    ports.sort(key=_serial_port_sort_key)
+    if not include_low_confidence:
+        ports = [port for port in ports if not _is_low_confidence_builtin_port(port)]
+    return [port.device for port in ports]
+
+
+def _serial_port_sort_key(port_info):
+    device = (port_info.device or "").lower()
+    description = (port_info.description or "").strip().lower()
+    hwid = (port_info.hwid or "").strip().lower()
+    manufacturer = (getattr(port_info, "manufacturer", None) or "").strip().lower()
+    interface = (getattr(port_info, "interface", None) or "").strip().lower()
+
+    text_blob = " ".join(
+        value
+        for value in [device, description, hwid, manufacturer, interface]
+        if value and value != "n/a"
+    )
+
+    usb_like_markers = (
+        "usb",
+        "acm",
+        "rs485",
+        "ftdi",
+        "cp210",
+        "silicon labs",
+        "wch",
+        "ch340",
+        "prolific",
+        "serial converter",
+        "uart",
+    )
+    is_probably_usb = any(marker in text_blob for marker in usb_like_markers)
+    is_low_confidence_builtin = _is_low_confidence_builtin_port(port_info)
+
+    return (
+        0 if is_probably_usb else 1,
+        1 if is_low_confidence_builtin else 0,
+        _natural_sort_key(port_info.device or ""),
+    )
+
+
+def _is_low_confidence_builtin_port(port_info):
+    device = (port_info.device or "").strip().lower()
+    description = (port_info.description or "").strip().lower()
+    hwid = (port_info.hwid or "").strip().lower()
+
+    return device.startswith("/dev/ttys") and description in {"", "n/a"} and hwid in {"", "n/a"}
+
+
+def _natural_sort_key(text):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
 def _to_serial_parity(parity_name):
@@ -107,17 +161,20 @@ class FC400ModbusClient:
         if self.serial_handle is not None and self.serial_handle.is_open:
             return
 
-        self.serial_handle = serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            bytesize=serial.EIGHTBITS,
-            parity=_to_serial_parity(self.parity),
-            stopbits=_to_serial_stopbits(self.stopbits),
-            timeout=self.timeout,
-            write_timeout=self.timeout,
-        )
-        self.serial_handle.reset_input_buffer()
-        self.serial_handle.reset_output_buffer()
+        try:
+            self.serial_handle = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=_to_serial_parity(self.parity),
+                stopbits=_to_serial_stopbits(self.stopbits),
+                timeout=self.timeout,
+                write_timeout=self.timeout,
+            )
+            self.serial_handle.reset_input_buffer()
+            self.serial_handle.reset_output_buffer()
+        except serial.SerialException as exc:
+            raise RuntimeError(f"FC400 serial port open failed: {self.port} ({exc})") from exc
 
     def close(self):
         if self.serial_handle is None:
@@ -141,25 +198,28 @@ class FC400ModbusClient:
         if self.serial_handle is None or not self.serial_handle.is_open:
             self.open()
 
-        request = struct.pack(
-            ">BBHH",
-            self.slave_id,
-            0x04,
-            int(start_rel_addr),
-            int(register_count),
-        )
-        request = self._append_crc(request)
-
-        self.serial_handle.reset_input_buffer()
-        self.serial_handle.write(request)
-        self.serial_handle.flush()
-
-        expected_bytes = 5 + register_count * 2
-        response = self._read_exactly(expected_bytes)
-        if len(response) != expected_bytes:
-            raise RuntimeError(
-                f"FC400 response timeout. expected {expected_bytes} bytes, got {len(response)} bytes."
+        try:
+            request = struct.pack(
+                ">BBHH",
+                self.slave_id,
+                0x04,
+                int(start_rel_addr),
+                int(register_count),
             )
+            request = self._append_crc(request)
+
+            self.serial_handle.reset_input_buffer()
+            self.serial_handle.write(request)
+            self.serial_handle.flush()
+
+            expected_bytes = 5 + register_count * 2
+            response = self._read_exactly(expected_bytes)
+            if len(response) != expected_bytes:
+                raise RuntimeError(
+                    f"FC400 response timeout. expected {expected_bytes} bytes, got {len(response)} bytes."
+                )
+        except serial.SerialException as exc:
+            raise RuntimeError(f"FC400 serial I/O failed on {self.port}: {exc}") from exc
 
         self._validate_crc(response)
 
