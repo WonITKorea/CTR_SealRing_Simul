@@ -5,3 +5,4 @@ matplotlib>=3.8.0
 PyQt5>=5.15.10
 nidaqmx>=1.4.1
 pyserial>=3.5
+opencv-python-headless>=4.10.0

@@ -68,9 +68,41 @@ The app can optionally read feedback position from a `Mitsubishi MR-MC240N` posi
 5. If needed, enable the optional `sscSystemStart()` checkbox when the board is not already in the running state.
 6. `Command Units / mm` must come from your servo/axis parameter set because it depends on the mechanical pitch, gear ratio, and electronic gearing of the machine.
 
+### UVC Camera / Ring Deformation
+
+The app can also open a standard UVC camera and estimate ring deformation with OpenCV.
+
+1. Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Connect a UVC camera to the PC.
+3. In the right-side `UVC Camera / Ring Deformation` panel, set:
+
+- `Camera Index`
+- `Resolution`
+- `Known Ring OD [mm]` (optional, but recommended for mm conversion)
+
+4. Click `Open Camera`.
+5. Center the ring in front of the camera.
+6. Click `Capture Baseline` before loading the ring.
+7. During the test, the app shows `Major Axis`, `Minor Axis`, `Ovality`, and the baseline-based deformation amount.
+
+The current implementation fits an ellipse to the detected ring contour and uses the change in the short axis as the primary deformation amount.
+
+If you see a Qt `xcb` plugin crash after installing OpenCV, remove `opencv-python` and keep `opencv-python-headless` only:
+
+```bash
+pip uninstall -y opencv-python
+pip install -r requirements.txt
+```
+
 ### Why these packages?
 
 * **`scikit-fem`**: Replaces FElupe as the Finite Element Analysis engine. It's lighter and stateless, making it perfect for real-time GUI updates.
 * **`scipy`**: Essential for solving sparse linear systems (`splinalg.spsolve`), which `scikit-fem` relies on.
 * **`numpy`**: Handles all matrix and vector operations.
 * **`PyQt5` \& `matplotlib`**: Same as before, for the GUI and plotting.
+* **`opencv-python-headless`**: UVC camera input and ring deformation analysis without conflicting with the PyQt GUI plugin stack.

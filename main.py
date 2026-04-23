@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
                              QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFileDialog, QMessageBox)
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -52,6 +53,39 @@ except Exception as exc:
     READ_ALL_AVAILABLE = None
     NIDAQMX_AVAILABLE = False
     NIDAQMX_IMPORT_ERROR = str(exc)
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+    CV2_IMPORT_ERROR = ""
+except Exception as exc:
+    cv2 = None
+    CV2_AVAILABLE = False
+    CV2_IMPORT_ERROR = str(exc)
+
+
+def _sanitize_qt_plugin_env_after_cv2_import():
+    if not CV2_AVAILABLE:
+        return
+
+    cv2_file = getattr(cv2, "__file__", "")
+    if not cv2_file:
+        return
+
+    cv2_package_dir = os.path.dirname(cv2_file)
+    cv2_qt_dir = os.path.normpath(os.path.join(cv2_package_dir, "qt"))
+
+    for env_key in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_PLUGIN_PATH"):
+        env_value = os.environ.get(env_key)
+        if not env_value:
+            continue
+
+        normalized_value = os.path.normpath(env_value)
+        if normalized_value.startswith(cv2_qt_dir):
+            os.environ.pop(env_key, None)
+
+
+_sanitize_qt_plugin_env_after_cv2_import()
 
 SIMULATION_SOURCE = "Simulation"
 CDAQ_SOURCE = "NI cDAQ USB (1ch -> 6ch)"
@@ -153,6 +187,13 @@ class ClampSimulatorApp(QMainWindow):
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
         self.position_zero_offset_mm = 0.0
+        self.camera_capture = None
+        self.camera_timer = QTimer(self)
+        self.camera_timer.timeout.connect(self.camera_timer_step)
+        self.camera_timer_interval_ms = 50
+        self.latest_ring_measurement = None
+        self.camera_baseline = None
+        self.camera_read_failures = 0
         
         # 데이터 저장소
         self.stroke_data_history = []  # 각 스트로크 최종 결과 저장
@@ -447,8 +488,79 @@ class ClampSimulatorApp(QMainWindow):
         main_layout.addWidget(left_container, 0)
         
         right_panel = QVBoxLayout()
+        top_visual_layout = QHBoxLayout()
+        top_visual_layout.setSpacing(12)
+
         self.chart = SpiderChartCanvas(self, width=6, height=5)
-        right_panel.addWidget(self.chart, 3)
+        top_visual_layout.addWidget(self.chart, 3)
+
+        group_camera = QGroupBox("UVC Camera / Ring Deformation")
+        group_camera.setMinimumWidth(470)
+        layout_camera = QGridLayout()
+        layout_camera.setColumnStretch(1, 1)
+        layout_camera.setColumnStretch(3, 1)
+
+        layout_camera.addWidget(QLabel("Camera Index:"), 0, 0)
+        self.in_camera_index = QLineEdit("0")
+        layout_camera.addWidget(self.in_camera_index, 0, 1)
+
+        layout_camera.addWidget(QLabel("Resolution:"), 0, 2)
+        self.camera_resolution_combo = QComboBox()
+        self.camera_resolution_combo.addItems(["640x480", "1280x720", "1920x1080"])
+        self.camera_resolution_combo.setCurrentText("1280x720")
+        layout_camera.addWidget(self.camera_resolution_combo, 0, 3)
+
+        layout_camera.addWidget(QLabel("Known Ring OD [mm]:"), 1, 0)
+        self.in_camera_reference_diameter = QLineEdit(self.jig_combo.currentText().split()[0])
+        self.in_camera_reference_diameter.setModified(False)
+        self.in_camera_reference_diameter.setToolTip("실제 링 외경(mm)을 입력하면 pixel 값을 mm로 환산합니다.")
+        layout_camera.addWidget(self.in_camera_reference_diameter, 1, 1)
+
+        self.btn_camera_toggle = QPushButton("Open Camera")
+        self.btn_camera_toggle.clicked.connect(self.toggle_camera)
+        layout_camera.addWidget(self.btn_camera_toggle, 1, 2)
+
+        self.btn_camera_baseline = QPushButton("Capture Baseline")
+        self.btn_camera_baseline.clicked.connect(self.capture_ring_baseline)
+        self.btn_camera_baseline.setEnabled(False)
+        layout_camera.addWidget(self.btn_camera_baseline, 1, 3)
+
+        self.btn_camera_clear_baseline = QPushButton("Clear Baseline")
+        self.btn_camera_clear_baseline.clicked.connect(self.clear_ring_baseline)
+        self.btn_camera_clear_baseline.setEnabled(False)
+        layout_camera.addWidget(self.btn_camera_clear_baseline, 2, 2, 1, 2)
+
+        init_camera_status = "Camera: connect a UVC camera and click Open Camera"
+        if not CV2_AVAILABLE:
+            init_camera_status = f"Camera: OpenCV import failed - {CV2_IMPORT_ERROR}"
+            self.btn_camera_toggle.setEnabled(False)
+        self.lbl_camera_status = QLabel(init_camera_status)
+        self.lbl_camera_status.setWordWrap(True)
+        layout_camera.addWidget(self.lbl_camera_status, 2, 0, 1, 2)
+
+        self.lbl_camera_preview = QLabel("Camera preview is not running.")
+        self.lbl_camera_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_camera_preview.setMinimumSize(440, 300)
+        self.lbl_camera_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.lbl_camera_preview.setStyleSheet(
+            "background-color: #111111; color: #DDDDDD; border: 1px solid #444444; padding: 8px;"
+        )
+        layout_camera.addWidget(self.lbl_camera_preview, 3, 0, 1, 4)
+
+        self.lbl_ring_metrics = QLabel(
+            "Ring measurement:\n"
+            "- Open the camera to start preview.\n"
+            "- Capture Baseline after the ring is centered."
+        )
+        self.lbl_ring_metrics.setWordWrap(True)
+        self.lbl_ring_metrics.setStyleSheet(
+            "background-color: #F8F8F8; border: 1px solid #D0D0D0; padding: 8px; font-family: monospace;"
+        )
+        layout_camera.addWidget(self.lbl_ring_metrics, 4, 0, 1, 4)
+
+        group_camera.setLayout(layout_camera)
+        top_visual_layout.addWidget(group_camera, 2)
+        right_panel.addLayout(top_visual_layout, 3)
         
         self.table = QTableWidget(6, 4)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -476,9 +588,401 @@ class ClampSimulatorApp(QMainWindow):
         self.update_table_headers()
         self.update_chart()
         self.on_input_source_changed(self.input_source)
+        self.update_camera_button_state()
+        self.update_ring_metrics_label()
 
     def update_camera_focus(self, size):
         self.lbl_camera.setText(f"Camera Focus Action: Adjusted to {size}")
+        if hasattr(self, "in_camera_reference_diameter") and not self.in_camera_reference_diameter.isModified():
+            self.in_camera_reference_diameter.setText(size.split()[0])
+
+    def set_camera_preview_message(self, message):
+        self.lbl_camera_preview.clear()
+        self.lbl_camera_preview.setText(message)
+
+    def update_camera_button_state(self):
+        camera_open = self.camera_capture is not None
+        if CV2_AVAILABLE:
+            self.btn_camera_toggle.setEnabled(True)
+            self.btn_camera_toggle.setText("Close Camera" if camera_open else "Open Camera")
+        else:
+            self.btn_camera_toggle.setEnabled(False)
+            self.btn_camera_toggle.setText("Open Camera")
+
+        self.btn_camera_baseline.setEnabled(camera_open and self.latest_ring_measurement is not None)
+        self.btn_camera_clear_baseline.setEnabled(self.camera_baseline is not None)
+
+    def get_camera_config(self):
+        if not CV2_AVAILABLE:
+            raise RuntimeError(f"OpenCV를 불러오지 못했습니다: {CV2_IMPORT_ERROR}")
+
+        camera_index = int(self.in_camera_index.text())
+        if camera_index < 0:
+            raise ValueError("Camera Index는 0 이상의 정수여야 합니다.")
+
+        resolution_text = self.camera_resolution_combo.currentText()
+        frame_width, frame_height = [int(token) for token in resolution_text.split("x")]
+
+        reference_text = self.in_camera_reference_diameter.text().strip()
+        reference_diameter_mm = None
+        if reference_text:
+            reference_diameter_mm = float(reference_text)
+            if reference_diameter_mm <= 0:
+                raise ValueError("Known Ring OD [mm]는 0보다 커야 합니다.")
+
+        return {
+            "camera_index": camera_index,
+            "frame_width": frame_width,
+            "frame_height": frame_height,
+            "reference_diameter_mm": reference_diameter_mm,
+        }
+
+    def toggle_camera(self):
+        if self.camera_capture is None:
+            try:
+                self.open_camera()
+            except Exception as exc:
+                self.close_camera(reset_status=False)
+                QMessageBox.warning(self, "Camera Error", f"UVC 카메라를 열지 못했습니다.\n{exc}")
+        else:
+            self.close_camera()
+
+    def open_camera(self):
+        if self.camera_capture is not None:
+            return
+
+        config = self.get_camera_config()
+        api_preference = cv2.CAP_DSHOW if os.name == "nt" and hasattr(cv2, "CAP_DSHOW") else cv2.CAP_ANY
+        capture = cv2.VideoCapture(config["camera_index"], api_preference)
+        if not capture.isOpened():
+            capture.release()
+            raise RuntimeError(f"Camera index {config['camera_index']}를 열 수 없습니다.")
+
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, config["frame_width"])
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, config["frame_height"])
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.camera_capture = capture
+        self.camera_read_failures = 0
+        self.latest_ring_measurement = None
+        self.camera_timer.start(self.camera_timer_interval_ms)
+        self.lbl_camera_status.setText(
+            f"Camera: opened UVC index {config['camera_index']} @ {config['frame_width']}x{config['frame_height']}"
+        )
+        self.set_camera_preview_message("Camera is starting...")
+        self.update_ring_metrics_label()
+        self.update_camera_button_state()
+
+    def close_camera(self, reset_status=True):
+        self.camera_timer.stop()
+        if self.camera_capture is not None:
+            try:
+                self.camera_capture.release()
+            except Exception:
+                pass
+
+        self.camera_capture = None
+        self.camera_read_failures = 0
+        self.latest_ring_measurement = None
+        if reset_status:
+            if CV2_AVAILABLE:
+                self.lbl_camera_status.setText("Camera: closed")
+            else:
+                self.lbl_camera_status.setText(f"Camera: OpenCV import failed - {CV2_IMPORT_ERROR}")
+        self.set_camera_preview_message("Camera preview is not running.")
+        self.update_ring_metrics_label()
+        self.update_camera_button_state()
+
+    def clear_ring_baseline(self):
+        self.camera_baseline = None
+        self.update_ring_metrics_label()
+        self.update_camera_button_state()
+        if self.camera_capture is not None:
+            self.lbl_camera_status.setText("Camera: running, baseline cleared")
+        else:
+            self.lbl_camera_status.setText("Camera: baseline cleared")
+
+    def capture_ring_baseline(self):
+        if self.latest_ring_measurement is None:
+            QMessageBox.warning(self, "Baseline Error", "기준 형상을 캡처하려면 먼저 링이 검출되어야 합니다.")
+            return
+
+        measurement = self.latest_ring_measurement
+        self.camera_baseline = {
+            "major_px": measurement["major_px"],
+            "minor_px": measurement["minor_px"],
+            "mean_px": measurement["mean_px"],
+            "ovality_px": measurement["ovality_px"],
+            "reference_diameter_mm": measurement.get("reference_diameter_mm"),
+            "mm_per_px": measurement.get("mm_per_px"),
+        }
+        self.lbl_camera_status.setText("Camera: baseline captured from current ring shape")
+        self.update_ring_metrics_label()
+        self.update_camera_button_state()
+
+    def camera_timer_step(self):
+        if self.camera_capture is None:
+            return
+
+        ok, frame = self.camera_capture.read()
+        if not ok or frame is None:
+            self.camera_read_failures += 1
+            if self.camera_read_failures >= 5:
+                self.lbl_camera_status.setText("Camera: frame read failed. Check the UVC device connection.")
+            return
+
+        self.camera_read_failures = 0
+        try:
+            measurement = self.measure_ring_from_frame(frame)
+        except Exception as exc:
+            self.lbl_camera_status.setText(f"Camera: measurement failed - {exc}")
+            measurement = None
+        self.latest_ring_measurement = measurement
+
+        display_frame = frame.copy()
+        display_frame = self.draw_ring_measurement_overlay(display_frame, measurement)
+        self.render_camera_frame(display_frame)
+        self.update_ring_metrics_label()
+        self.update_camera_button_state()
+
+        if measurement is None:
+            self.lbl_camera_status.setText("Camera: running, but the ring was not detected")
+        elif self.camera_baseline is not None:
+            self.lbl_camera_status.setText("Camera: running, ring detected, baseline active")
+        else:
+            self.lbl_camera_status.setText("Camera: running, ring detected")
+
+    def measure_ring_from_frame(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        edges = cv2.Canny(blurred, 40, 120)
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours_info = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
+        if not contours:
+            return None
+
+        frame_height, frame_width = gray.shape
+        frame_area = frame_height * frame_width
+        frame_center = np.array([frame_width / 2.0, frame_height / 2.0], dtype=np.float32)
+
+        best_candidate = None
+        best_score = None
+        for contour in contours:
+            if len(contour) < 20:
+                continue
+
+            area = cv2.contourArea(contour)
+            if area < frame_area * 0.01:
+                continue
+
+            try:
+                ellipse = cv2.fitEllipse(contour)
+            except cv2.error:
+                continue
+
+            (center_x, center_y), (axis_a, axis_b), angle = ellipse
+            major_px, minor_px = sorted([float(axis_a), float(axis_b)], reverse=True)
+            if major_px <= 10 or minor_px <= 10:
+                continue
+            if minor_px / max(major_px, 1e-6) < 0.35:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if x <= 1 or y <= 1 or (x + w) >= (frame_width - 1) or (y + h) >= (frame_height - 1):
+                continue
+
+            ellipse_area = np.pi * (major_px * 0.5) * (minor_px * 0.5)
+            fill_ratio = area / max(ellipse_area, 1.0)
+            if fill_ratio < 0.35 or fill_ratio > 1.35:
+                continue
+
+            center_distance = float(np.linalg.norm(np.array([center_x, center_y]) - frame_center))
+            score = area - (center_distance * 1.5)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_candidate = {
+                    "ellipse": ellipse,
+                    "center": (float(center_x), float(center_y)),
+                    "angle": float(angle),
+                    "major_px": major_px,
+                    "minor_px": minor_px,
+                    "area": float(area),
+                    "fill_ratio": float(fill_ratio),
+                }
+
+        if best_candidate is None:
+            return None
+
+        mean_px = 0.5 * (best_candidate["major_px"] + best_candidate["minor_px"])
+        ovality_px = best_candidate["major_px"] - best_candidate["minor_px"]
+        measurement = {
+            **best_candidate,
+            "mean_px": float(mean_px),
+            "ovality_px": float(ovality_px),
+            "reference_diameter_mm": self.get_camera_config()["reference_diameter_mm"],
+        }
+
+        mm_per_px = None
+        if self.camera_baseline is not None and self.camera_baseline.get("mm_per_px"):
+            mm_per_px = self.camera_baseline["mm_per_px"]
+        elif measurement["reference_diameter_mm"] is not None and mean_px > 0:
+            mm_per_px = measurement["reference_diameter_mm"] / mean_px
+        measurement["mm_per_px"] = mm_per_px
+
+        if mm_per_px is not None:
+            measurement["major_mm"] = measurement["major_px"] * mm_per_px
+            measurement["minor_mm"] = measurement["minor_px"] * mm_per_px
+            measurement["mean_mm"] = measurement["mean_px"] * mm_per_px
+            measurement["ovality_mm"] = measurement["ovality_px"] * mm_per_px
+
+        if self.camera_baseline is not None:
+            measurement["delta_major_px"] = measurement["major_px"] - self.camera_baseline["major_px"]
+            measurement["delta_minor_px"] = measurement["minor_px"] - self.camera_baseline["minor_px"]
+            measurement["delta_mean_px"] = measurement["mean_px"] - self.camera_baseline["mean_px"]
+            measurement["delta_ovality_px"] = measurement["ovality_px"] - self.camera_baseline["ovality_px"]
+            if mm_per_px is not None:
+                measurement["delta_major_mm"] = measurement["delta_major_px"] * mm_per_px
+                measurement["delta_minor_mm"] = measurement["delta_minor_px"] * mm_per_px
+                measurement["delta_mean_mm"] = measurement["delta_mean_px"] * mm_per_px
+                measurement["delta_ovality_mm"] = measurement["delta_ovality_px"] * mm_per_px
+                measurement["deformation_mm"] = abs(measurement["delta_minor_mm"])
+
+        return measurement
+
+    def draw_ring_measurement_overlay(self, frame, measurement):
+        if measurement is None:
+            cv2.putText(
+                frame,
+                "Ring not detected",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return frame
+
+        cv2.ellipse(frame, measurement["ellipse"], (0, 255, 0), 2)
+        center_x, center_y = measurement["center"]
+        cv2.circle(frame, (int(center_x), int(center_y)), 4, (255, 0, 0), -1)
+
+        overlay_lines = [
+            f"Major: {measurement['major_px']:.1f}px",
+            f"Minor: {measurement['minor_px']:.1f}px",
+            f"Ovality: {measurement['ovality_px']:.1f}px",
+        ]
+        if measurement.get("major_mm") is not None:
+            overlay_lines = [
+                f"Major: {measurement['major_mm']:.3f}mm",
+                f"Minor: {measurement['minor_mm']:.3f}mm",
+                f"Ovality: {measurement['ovality_mm']:.3f}mm",
+            ]
+        if measurement.get("deformation_mm") is not None:
+            overlay_lines.append(f"Deformation: {measurement['deformation_mm']:.3f}mm")
+
+        origin_y = 30
+        for line in overlay_lines:
+            cv2.putText(
+                frame,
+                line,
+                (20, origin_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (36, 255, 12),
+                2,
+                cv2.LINE_AA,
+            )
+            origin_y += 26
+
+        return frame
+
+    def render_camera_frame(self, frame):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb_frame.shape
+        bytes_per_line = channels * width
+        image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        scaled_pixmap = pixmap.scaled(
+            self.lbl_camera_preview.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.lbl_camera_preview.setPixmap(scaled_pixmap)
+
+    def update_ring_metrics_label(self):
+        if self.latest_ring_measurement is None:
+            baseline_text = "captured" if self.camera_baseline is not None else "not captured"
+            self.lbl_ring_metrics.setText(
+                "Ring measurement:\n"
+                "- Detection: waiting for a visible ring contour\n"
+                f"- Baseline: {baseline_text}\n"
+                "- Tip: center the ring and use a plain background for stable detection"
+            )
+            return
+
+        measurement = self.latest_ring_measurement
+        lines = [
+            "Ring measurement:",
+            f"- Major Axis: {measurement['major_px']:.2f} px",
+            f"- Minor Axis: {measurement['minor_px']:.2f} px",
+            f"- Mean Diameter: {measurement['mean_px']:.2f} px",
+            f"- Ovality: {measurement['ovality_px']:.2f} px",
+        ]
+        if measurement.get("major_mm") is not None:
+            lines.extend(
+                [
+                    f"- Major Axis: {measurement['major_mm']:.3f} mm",
+                    f"- Minor Axis: {measurement['minor_mm']:.3f} mm",
+                    f"- Mean Diameter: {measurement['mean_mm']:.3f} mm",
+                    f"- Ovality: {measurement['ovality_mm']:.3f} mm",
+                ]
+            )
+
+        if self.camera_baseline is None:
+            lines.append("- Baseline: not captured")
+        else:
+            lines.append("- Baseline: captured")
+            if "delta_minor_px" in measurement and "delta_ovality_px" in measurement:
+                lines.append(f"- Delta Minor Axis: {measurement['delta_minor_px']:+.2f} px")
+                lines.append(f"- Delta Ovality: {measurement['delta_ovality_px']:+.2f} px")
+            else:
+                lines.append("- Delta: waiting for the next frame after baseline capture")
+
+            if measurement.get("deformation_mm") is not None:
+                lines.append(f"- Delta Minor Axis: {measurement['delta_minor_mm']:+.3f} mm")
+                lines.append(f"- Deformation Amount: {measurement['deformation_mm']:.3f} mm")
+
+        self.lbl_ring_metrics.setText("\n".join(lines))
+
+    def append_camera_metrics_to_log_row(self, log_row):
+        measurement = self.latest_ring_measurement
+        if measurement is None:
+            return
+
+        log_row["Ring Major [px]"] = round(measurement["major_px"], 2)
+        log_row["Ring Minor [px]"] = round(measurement["minor_px"], 2)
+        log_row["Ring Mean Diameter [px]"] = round(measurement["mean_px"], 2)
+        log_row["Ring Ovality [px]"] = round(measurement["ovality_px"], 2)
+
+        if measurement.get("major_mm") is not None:
+            log_row["Ring Major [mm]"] = round(measurement["major_mm"], 3)
+            log_row["Ring Minor [mm]"] = round(measurement["minor_mm"], 3)
+            log_row["Ring Mean Diameter [mm]"] = round(measurement["mean_mm"], 3)
+            log_row["Ring Ovality [mm]"] = round(measurement["ovality_mm"], 3)
+
+        if self.camera_baseline is not None:
+            if "delta_minor_px" in measurement and "delta_ovality_px" in measurement:
+                log_row["Ring Delta Minor [px]"] = round(measurement["delta_minor_px"], 2)
+                log_row["Ring Delta Ovality [px]"] = round(measurement["delta_ovality_px"], 2)
+            if measurement.get("deformation_mm") is not None:
+                log_row["Ring Delta Minor [mm]"] = round(measurement["delta_minor_mm"], 3)
+                log_row["Ring Deformation [mm]"] = round(measurement["deformation_mm"], 3)
 
     def is_cdaq_mode(self):
         return self.input_source == CDAQ_SOURCE
@@ -1077,6 +1581,7 @@ class ClampSimulatorApp(QMainWindow):
             log_row[f'Axis {i+1} Raw [{self.data_unit}]'] = round(self.raw_data[i], 3)
         for i in range(6):
             log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated_display[i], 3)
+        self.append_camera_metrics_to_log_row(log_row)
         self.time_series_data.append(log_row)
 
         source_name = "cDAQ" if self.is_cdaq_mode() else "FC400"
@@ -1314,6 +1819,7 @@ class ClampSimulatorApp(QMainWindow):
         # 1~6축 Calibrated Data 추가
         for i in range(6):
             log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated[i], 2)
+        self.append_camera_metrics_to_log_row(log_row)
             
         self.time_series_data.append(log_row)
 
@@ -1578,6 +2084,7 @@ class ClampSimulatorApp(QMainWindow):
         QMessageBox.information(self, "Saved", f"A4 성적서가 성공적으로 저장되었습니다.\n{file_name}")
 
     def closeEvent(self, event):
+        self.close_camera(reset_status=False)
         self.close_cdaq_task()
         self.close_fc400_client()
         self.close_position_monitor()
