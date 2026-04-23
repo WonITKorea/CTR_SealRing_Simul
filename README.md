@@ -1,5 +1,6 @@
 # CTR_SealRing_Simul
 
+Korean README: [README_ko.md](README_ko.md)
 
 
 ### How to Install
