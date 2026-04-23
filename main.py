@@ -5,8 +5,8 @@ import pandas as pd
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFileDialog, QMessageBox, QScrollArea)
-from PyQt5.QtCore import QTimer
+                             QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFileDialog, QMessageBox)
+from PyQt5.QtCore import Qt, QTimer
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -129,7 +129,7 @@ class ClampSimulatorApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("6-Axis Clamp Test Machine Simulator")
-        self.setGeometry(100, 100, 1300, 900)
+        self.configure_window_geometry()
         self.unit = "kgf"
         
         self.is_simulating = False
@@ -164,16 +164,43 @@ class ClampSimulatorApp(QMainWindow):
         self.test_start_display_time = None
         
         self.initUI()
+
+    def configure_window_geometry(self):
+        base_width = 1820
+        base_height = 1180
+        fallback_min_width = 1200
+        fallback_min_height = 760
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(base_width, base_height)
+            self.setMinimumSize(fallback_min_width, fallback_min_height)
+            return
+
+        available = screen.availableGeometry()
+        start_width = min(base_width, available.width())
+        start_height = min(base_height, available.height())
+        min_width = min(fallback_min_width, available.width())
+        min_height = min(fallback_min_height, available.height())
+
+        self.setGeometry(available.x(), available.y(), start_width, start_height)
+        self.setMinimumSize(min_width, min_height)
         
     def initUI(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
-        
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_widget = QWidget()
-        left_panel = QVBoxLayout(scroll_widget)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(14)
+
+        left_container = QWidget()
+        left_container.setMinimumWidth(920)
+        left_layout = QGridLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setHorizontalSpacing(12)
+        left_layout.setVerticalSpacing(10)
+        left_layout.setColumnStretch(0, 1)
+        left_layout.setColumnStretch(1, 1)
         
         group_report = QGroupBox("Report Information")
         layout_report = QGridLayout()
@@ -193,7 +220,7 @@ class ClampSimulatorApp(QMainWindow):
         self.in_part_no = QLineEdit("GCR0127")
         layout_report.addWidget(self.in_part_no, 4, 1)
         group_report.setLayout(layout_report)
-        left_panel.addWidget(group_report)
+        left_layout.addWidget(group_report, 0, 0)
 
         group_jig = QGroupBox("Jig Size & Camera Focus")
         layout_jig = QVBoxLayout()
@@ -205,7 +232,7 @@ class ClampSimulatorApp(QMainWindow):
         layout_jig.addWidget(self.jig_combo)
         layout_jig.addWidget(self.lbl_camera)
         group_jig.setLayout(layout_jig)
-        left_panel.addWidget(group_jig)
+        left_layout.addWidget(group_jig, 0, 1)
         
         group_params = QGroupBox("Test Parameters")
         layout_params = QGridLayout()
@@ -231,7 +258,7 @@ class ClampSimulatorApp(QMainWindow):
         self.lbl_status.setStyleSheet("color: blue; font-weight: bold;")
         layout_params.addWidget(self.lbl_status, 6, 0, 1, 2)
         group_params.setLayout(layout_params)
-        left_panel.addWidget(group_params)
+        left_layout.addWidget(group_params, 1, 0)
         
         group_settings = QGroupBox("Settings")
         layout_settings = QVBoxLayout()
@@ -251,54 +278,74 @@ class ClampSimulatorApp(QMainWindow):
         self.btn_zero.clicked.connect(self.zero_sensors)
         layout_settings.addWidget(self.btn_zero)
         group_settings.setLayout(layout_settings)
-        left_panel.addWidget(group_settings)
+        left_layout.addWidget(group_settings, 1, 1)
 
         group_daq = QGroupBox("Load Input Source / NI cDAQ")
         layout_daq = QGridLayout()
+        layout_daq.setColumnStretch(1, 1)
 
-        layout_daq.addWidget(QLabel("Input Source:"), 0, 0)
-        self.source_combo = QComboBox()
-        self.source_combo.addItems([SIMULATION_SOURCE, CDAQ_SOURCE, FC400_SOURCE])
-        self.source_combo.currentTextChanged.connect(self.on_input_source_changed)
-        layout_daq.addWidget(self.source_combo, 0, 1)
+        layout_daq.addWidget(QLabel("Input Source:"), 0, 0, 1, 2)
+        source_button_layout = QHBoxLayout()
+        source_button_layout.setSpacing(8)
+        self.source_buttons = {}
+        source_button_specs = [
+            ("Simulation", SIMULATION_SOURCE),
+            ("NI cDAQ", CDAQ_SOURCE),
+            ("FC400 RS-485", FC400_SOURCE),
+        ]
+        for button_label, source_name in source_button_specs:
+            button = QPushButton(button_label)
+            button.setCheckable(True)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumHeight(34)
+            button.setStyleSheet(
+                "QPushButton {padding: 8px 10px; background-color: #F5F7FA; border: 1px solid #B8C1CC;}"
+                "QPushButton:checked {background-color: #1976D2; color: white; border: 1px solid #0D47A1;}"
+            )
+            button.clicked.connect(
+                lambda _checked, selected_source=source_name: self.on_input_source_button_clicked(selected_source)
+            )
+            self.source_buttons[source_name] = button
+            source_button_layout.addWidget(button)
+        layout_daq.addLayout(source_button_layout, 1, 0, 1, 2)
 
-        layout_daq.addWidget(QLabel("Physical Channel:"), 1, 0)
+        layout_daq.addWidget(QLabel("Physical Channel:"), 2, 0)
         self.in_daq_channel = QLineEdit("cDAQ1Mod1/ai0")
-        layout_daq.addWidget(self.in_daq_channel, 1, 1)
+        layout_daq.addWidget(self.in_daq_channel, 2, 1)
 
-        layout_daq.addWidget(QLabel("Rated Load [kgf]:"), 2, 0)
+        layout_daq.addWidget(QLabel("Rated Load [kgf]:"), 3, 0)
         self.in_daq_capacity = QLineEdit("100.0")
-        layout_daq.addWidget(self.in_daq_capacity, 2, 1)
+        layout_daq.addWidget(self.in_daq_capacity, 3, 1)
 
-        layout_daq.addWidget(QLabel("Sensitivity [mV/V]:"), 3, 0)
+        layout_daq.addWidget(QLabel("Sensitivity [mV/V]:"), 4, 0)
         self.in_daq_sensitivity = QLineEdit("2.0")
-        layout_daq.addWidget(self.in_daq_sensitivity, 3, 1)
+        layout_daq.addWidget(self.in_daq_sensitivity, 4, 1)
 
-        layout_daq.addWidget(QLabel("Bridge Resistance [Ohm]:"), 4, 0)
+        layout_daq.addWidget(QLabel("Bridge Resistance [Ohm]:"), 5, 0)
         self.in_daq_bridge_res = QLineEdit("350")
-        layout_daq.addWidget(self.in_daq_bridge_res, 4, 1)
+        layout_daq.addWidget(self.in_daq_bridge_res, 5, 1)
 
-        layout_daq.addWidget(QLabel("Excitation [V]:"), 5, 0)
+        layout_daq.addWidget(QLabel("Excitation [V]:"), 6, 0)
         self.in_daq_excitation = QLineEdit("5.0")
-        layout_daq.addWidget(self.in_daq_excitation, 5, 1)
+        layout_daq.addWidget(self.in_daq_excitation, 6, 1)
 
-        layout_daq.addWidget(QLabel("Sample Rate [S/s]:"), 6, 0)
+        layout_daq.addWidget(QLabel("Sample Rate [S/s]:"), 7, 0)
         self.in_daq_sample_rate = QLineEdit(f"{DEFAULT_NI_9237_SAMPLE_RATE:.3f}")
-        layout_daq.addWidget(self.in_daq_sample_rate, 6, 1)
+        layout_daq.addWidget(self.in_daq_sample_rate, 7, 1)
 
         self.btn_refresh_daq = QPushButton("Refresh NI Devices")
         self.btn_refresh_daq.clicked.connect(self.refresh_cdaq_devices)
-        layout_daq.addWidget(self.btn_refresh_daq, 7, 0, 1, 2)
+        layout_daq.addWidget(self.btn_refresh_daq, 8, 0, 1, 2)
 
         init_daq_status = "cDAQ: select USB mode to scan devices"
         if not NIDAQMX_AVAILABLE:
             init_daq_status = f"cDAQ: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
         self.lbl_daq_status = QLabel(init_daq_status)
         self.lbl_daq_status.setWordWrap(True)
-        layout_daq.addWidget(self.lbl_daq_status, 8, 0, 1, 2)
+        layout_daq.addWidget(self.lbl_daq_status, 9, 0, 1, 2)
 
         group_daq.setLayout(layout_daq)
-        left_panel.addWidget(group_daq)
+        left_layout.addWidget(group_daq, 2, 0)
 
         group_fc400 = QGroupBox("UNIPULSE FC400 RS-485")
         layout_fc400 = QGridLayout()
@@ -351,7 +398,7 @@ class ClampSimulatorApp(QMainWindow):
         layout_fc400.addWidget(self.lbl_fc400_status, 8, 0, 1, 2)
 
         group_fc400.setLayout(layout_fc400)
-        left_panel.addWidget(group_fc400)
+        left_layout.addWidget(group_fc400, 2, 1)
 
         group_position = QGroupBox("Mitsubishi MR-MC240N Position Monitor")
         layout_position = QGridLayout()
@@ -389,16 +436,15 @@ class ClampSimulatorApp(QMainWindow):
         layout_position.addWidget(self.lbl_mr_status, 6, 0, 1, 2)
 
         group_position.setLayout(layout_position)
-        left_panel.addWidget(group_position)
+        left_layout.addWidget(group_position, 3, 1)
         
         self.btn_start = QPushButton("Start Test Simulation")
         self.btn_start.clicked.connect(self.toggle_simulation)
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
-        left_panel.addWidget(self.btn_start)
-        left_panel.addStretch()
+        left_layout.addWidget(self.btn_start, 4, 0, 1, 2)
+        left_layout.setRowStretch(5, 1)
         
-        scroll_area.setWidget(scroll_widget)
-        main_layout.addWidget(scroll_area, 1)
+        main_layout.addWidget(left_container, 0)
         
         right_panel = QVBoxLayout()
         self.chart = SpiderChartCanvas(self, width=6, height=5)
@@ -421,7 +467,7 @@ class ClampSimulatorApp(QMainWindow):
         btn_layout.addWidget(self.btn_pdf)
         right_panel.addLayout(btn_layout)
         
-        main_layout.addLayout(right_panel, 3)
+        main_layout.addLayout(right_panel, 1)
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_step)
         
@@ -429,7 +475,7 @@ class ClampSimulatorApp(QMainWindow):
         self.on_position_monitor_toggled(False)
         self.update_table_headers()
         self.update_chart()
-        self.on_input_source_changed(self.source_combo.currentText())
+        self.on_input_source_changed(self.input_source)
 
     def update_camera_focus(self, size):
         self.lbl_camera.setText(f"Camera Focus Action: Adjusted to {size}")
@@ -492,6 +538,18 @@ class ClampSimulatorApp(QMainWindow):
         else:
             self.lbl_fc400_status.setText("FC400: no serial ports detected")
 
+    def update_input_source_buttons(self):
+        for source_name, button in self.source_buttons.items():
+            previous_state = button.blockSignals(True)
+            button.setChecked(source_name == self.input_source)
+            button.blockSignals(previous_state)
+
+    def on_input_source_button_clicked(self, source):
+        if source == self.input_source:
+            self.update_input_source_buttons()
+            return
+        self.on_input_source_changed(source)
+
     def on_position_monitor_toggled(self, enabled):
         widgets = [
             self.in_mr_dll_path,
@@ -544,6 +602,7 @@ class ClampSimulatorApp(QMainWindow):
             self.stop_simulation(completed=False, source_override=previous_source)
 
         self.input_source = source
+        self.update_input_source_buttons()
         use_cdaq = self.is_cdaq_mode()
         use_fc400 = self.is_fc400_mode()
         if (
@@ -1524,8 +1583,24 @@ class ClampSimulatorApp(QMainWindow):
         self.close_position_monitor()
         super().closeEvent(event)
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_F11:
+            if self.isFullScreen():
+                self.showMaximized()
+            else:
+                self.showFullScreen()
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.showMaximized()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     ex = ClampSimulatorApp()
-    ex.show()
+    ex.showFullScreen()
     sys.exit(app.exec_())
