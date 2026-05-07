@@ -1,5 +1,7 @@
 import sys
 import os
+import threading
+import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -91,6 +93,76 @@ SIMULATION_SOURCE = "Simulation"
 CDAQ_SOURCE = "NI cDAQ USB (1ch -> 6ch)"
 FC400_SOURCE = "UNIPULSE FC400 RS-485"
 DEFAULT_NI_9237_SAMPLE_RATE = 12_800_000.0 / 256.0 / 31.0
+CAMERA_RING_COLOR_PROFILES = {
+    "silver": {
+        "label": "Silver / 은색",
+        "status_name": "silver",
+        "description": "silver clamp ring",
+        "mode": "neutral",
+        "s_max": 75,
+        "v_min": 55,
+        "v_floor_percentile": 25,
+        "v_floor_ceiling": 160,
+        "neutral_tol": 18,
+    },
+    "white": {
+        "label": "White / 흰색",
+        "status_name": "white",
+        "description": "white clamp ring",
+        "mode": "neutral",
+        "s_max": 55,
+        "v_min": 150,
+        "v_floor_percentile": 35,
+        "v_floor_ceiling": 235,
+        "neutral_tol": 14,
+    },
+    "black": {
+        "label": "Black / 검정",
+        "status_name": "black",
+        "description": "black clamp ring",
+        "mode": "dark-neutral",
+        "s_max": 85,
+        "v_max": 95,
+        "neutral_tol": 18,
+    },
+    "red": {
+        "label": "Red / 빨강",
+        "status_name": "red",
+        "description": "red clamp ring",
+        "mode": "hsv",
+        "ranges": [
+            ((0, 80, 35), (10, 255, 255)),
+            ((170, 80, 35), (179, 255, 255)),
+        ],
+    },
+    "blue": {
+        "label": "Blue / 파랑",
+        "status_name": "blue",
+        "description": "blue clamp ring",
+        "mode": "hsv",
+        "ranges": [
+            ((95, 70, 35), (135, 255, 255)),
+        ],
+    },
+    "green": {
+        "label": "Green / 초록",
+        "status_name": "green",
+        "description": "green clamp ring",
+        "mode": "hsv",
+        "ranges": [
+            ((35, 55, 35), (95, 255, 255)),
+        ],
+    },
+    "yellow": {
+        "label": "Yellow / 노랑",
+        "status_name": "yellow",
+        "description": "yellow clamp ring",
+        "mode": "hsv",
+        "ranges": [
+            ((15, 80, 60), (40, 255, 255)),
+        ],
+    },
+}
 
 # 한글 폰트 강제 로드 (OS 자동 인식)
 font_path = None
@@ -118,18 +190,67 @@ class SpiderChartCanvas(FigureCanvas):
         self.ax = self.fig.add_subplot(111, polar=True)
         super(SpiderChartCanvas, self).__init__(self.fig)
         self.angles = np.linspace(0, 2 * np.pi, 6, endpoint=False).tolist()
-        self.angles_closed = self.angles + [self.angles[0]]  
+        self.angles_closed = self.angles + [self.angles[0]]
+        self.default_radius_limit = 10.0
+        self.min_radius_limit = 2.5
+        self.scale_decay = 0.70
+        self.radius_limit = self.default_radius_limit
 
-    def plot_data(self, data, interpolate_type="Linear (직선)", unit="kgf"):
+    def reset_scale(self):
+        self.radius_limit = self.default_radius_limit
+
+    @staticmethod
+    def _nice_radius_limit(peak_value):
+        if peak_value <= 0:
+            return 10.0
+
+        padded_value = peak_value * 1.2
+        magnitude = 10 ** np.floor(np.log10(padded_value))
+        normalized = padded_value / magnitude
+
+        if normalized <= 1.0:
+            nice_normalized = 1.0
+        elif normalized <= 2.0:
+            nice_normalized = 2.0
+        elif normalized <= 2.5:
+            nice_normalized = 2.5
+        elif normalized <= 5.0:
+            nice_normalized = 5.0
+        else:
+            nice_normalized = 10.0
+
+        return float(nice_normalized * magnitude)
+
+    def plot_data(self, data, interpolate_type="Linear (직선)", unit="kgf", reset_scale=False):
+        if reset_scale:
+            self.reset_scale()
+
         self.ax.clear()
         self.ax.set_theta_offset(np.pi / 2) 
         self.ax.set_theta_direction(-1)     
         self.ax.set_xticks(self.angles)
         self.ax.set_xticklabels(['Axis 1', 'Axis 2', 'Axis 3', 'Axis 4', 'Axis 5', 'Axis 6'], fontproperties=font_prop)
-        
-        max_val = max(data) if data else 10
-        if max_val < 1: max_val = 10 
-        self.ax.set_ylim(0, max_val * 1.2)
+
+        peak_value = max(data) if data else 0.0
+        if peak_value <= 0:
+            suggested_radius_limit = self.min_radius_limit
+        else:
+            suggested_radius_limit = self._nice_radius_limit(peak_value)
+
+        if reset_scale:
+            self.radius_limit = suggested_radius_limit
+        elif suggested_radius_limit >= self.radius_limit:
+            self.radius_limit = suggested_radius_limit
+        else:
+            self.radius_limit = suggested_radius_limit + (
+                self.radius_limit - suggested_radius_limit
+            ) * self.scale_decay
+            if abs(self.radius_limit - suggested_radius_limit) <= max(0.1, suggested_radius_limit * 0.05):
+                self.radius_limit = suggested_radius_limit
+
+        self.radius_limit = max(self.radius_limit, self.min_radius_limit)
+
+        self.ax.set_ylim(0, self.radius_limit)
         self.ax.set_ylabel(f"Load ({unit})", labelpad=20, fontproperties=font_prop)
 
         plot_data = data + [data[0]]
@@ -188,9 +309,32 @@ class ClampSimulatorApp(QMainWindow):
         self.latest_live_position_counts = None
         self.position_zero_offset_mm = 0.0
         self.camera_capture = None
+        self.camera_capture_thread = None
+        self.camera_capture_stop_event = threading.Event()
+        self.camera_frame_lock = threading.Lock()
+        self.camera_latest_frame = None
+        self.camera_latest_frame_id = 0
+        self.camera_processed_frame_id = 0
+        self.camera_latest_frame_timestamp = 0.0
         self.camera_timer = QTimer(self)
         self.camera_timer.timeout.connect(self.camera_timer_step)
-        self.camera_timer_interval_ms = 50
+        self.camera_timer.setTimerType(Qt.PreciseTimer)
+        self.camera_timer_interval_ms = 16
+        self.camera_analysis_interval_ms = 50
+        self.camera_metrics_update_interval_ms = 120
+        self.camera_analysis_max_width = 960
+        self.camera_morph_kernel = np.ones((3, 3), np.uint8)
+        self.camera_tracking_roi = None
+        self.camera_ring_min_axis_ratio = 0.55
+        self.camera_ring_min_circularity = 0.42
+        self.camera_ring_max_ellipse_error = 0.18
+        self.camera_ring_min_band_silver_ratio = 0.44
+        self.camera_ring_min_band_hole_gap = 0.10
+        self.camera_ring_band_inner_scale = 0.70
+        self.camera_ring_hole_probe_scale = 0.42
+        self.camera_reference_diameter_mm = None
+        self.camera_last_analysis_ts = 0.0
+        self.camera_last_metrics_update_ts = 0.0
         self.latest_ring_measurement = None
         self.camera_baseline = None
         self.camera_read_failures = 0
@@ -516,6 +660,14 @@ class ClampSimulatorApp(QMainWindow):
         self.in_camera_reference_diameter.setToolTip("실제 링 외경(mm)을 입력하면 pixel 값을 mm로 환산합니다.")
         layout_camera.addWidget(self.in_camera_reference_diameter, 1, 1)
 
+        layout_camera.addWidget(QLabel("Clamp Ring Color:"), 2, 0)
+        self.camera_ring_color_combo = QComboBox()
+        for profile_key, profile in CAMERA_RING_COLOR_PROFILES.items():
+            self.camera_ring_color_combo.addItem(profile["label"], profile_key)
+        self.camera_ring_color_combo.setCurrentIndex(self.camera_ring_color_combo.findData("silver"))
+        self.camera_ring_color_combo.currentTextChanged.connect(self.on_camera_ring_color_changed)
+        layout_camera.addWidget(self.camera_ring_color_combo, 2, 1)
+
         self.btn_camera_toggle = QPushButton("Open Camera")
         self.btn_camera_toggle.clicked.connect(self.toggle_camera)
         layout_camera.addWidget(self.btn_camera_toggle, 1, 2)
@@ -536,7 +688,7 @@ class ClampSimulatorApp(QMainWindow):
             self.btn_camera_toggle.setEnabled(False)
         self.lbl_camera_status = QLabel(init_camera_status)
         self.lbl_camera_status.setWordWrap(True)
-        layout_camera.addWidget(self.lbl_camera_status, 2, 0, 1, 2)
+        layout_camera.addWidget(self.lbl_camera_status, 3, 0, 1, 4)
 
         self.lbl_camera_preview = QLabel("Camera preview is not running.")
         self.lbl_camera_preview.setAlignment(Qt.AlignCenter)
@@ -545,18 +697,18 @@ class ClampSimulatorApp(QMainWindow):
         self.lbl_camera_preview.setStyleSheet(
             "background-color: #111111; color: #DDDDDD; border: 1px solid #444444; padding: 8px;"
         )
-        layout_camera.addWidget(self.lbl_camera_preview, 3, 0, 1, 4)
+        layout_camera.addWidget(self.lbl_camera_preview, 4, 0, 1, 4)
 
         self.lbl_ring_metrics = QLabel(
             "Ring measurement:\n"
-            "- Open the camera to start preview.\n"
-            "- Capture Baseline after the ring is centered."
+            "- Select the clamp ring color before opening the camera.\n"
+            "- Open the camera and center the ring before baseline capture."
         )
         self.lbl_ring_metrics.setWordWrap(True)
         self.lbl_ring_metrics.setStyleSheet(
             "background-color: #F8F8F8; border: 1px solid #D0D0D0; padding: 8px; font-family: monospace;"
         )
-        layout_camera.addWidget(self.lbl_ring_metrics, 4, 0, 1, 4)
+        layout_camera.addWidget(self.lbl_ring_metrics, 5, 0, 1, 4)
 
         group_camera.setLayout(layout_camera)
         top_visual_layout.addWidget(group_camera, 2)
@@ -600,6 +752,55 @@ class ClampSimulatorApp(QMainWindow):
         self.lbl_camera_preview.clear()
         self.lbl_camera_preview.setText(message)
 
+    def set_camera_status_text(self, message):
+        if self.lbl_camera_status.text() != message:
+            self.lbl_camera_status.setText(message)
+
+    def get_camera_reference_diameter_value(self):
+        reference_text = self.in_camera_reference_diameter.text().strip()
+        if not reference_text:
+            return None
+
+        reference_diameter_mm = float(reference_text)
+        if reference_diameter_mm <= 0:
+            raise ValueError("Known Ring OD [mm]는 0보다 커야 합니다.")
+        return reference_diameter_mm
+
+    def get_camera_ring_color_key(self):
+        if not hasattr(self, "camera_ring_color_combo"):
+            return "silver"
+        color_key = self.camera_ring_color_combo.currentData()
+        if color_key not in CAMERA_RING_COLOR_PROFILES:
+            return "silver"
+        return color_key
+
+    def get_camera_ring_color_profile(self):
+        return CAMERA_RING_COLOR_PROFILES[self.get_camera_ring_color_key()]
+
+    def get_camera_ring_target_description(self):
+        return self.get_camera_ring_color_profile()["description"]
+
+    def get_camera_ring_color_tip(self):
+        color_key = self.get_camera_ring_color_key()
+        if color_key in {"silver", "white"}:
+            return "use a plain dark background so the selected ring color stands out"
+        if color_key == "black":
+            return "use a bright plain background so the selected ring color stands out"
+        return "use a background that contrasts clearly with the selected ring color"
+
+    def on_camera_ring_color_changed(self, _text=None):
+        self.camera_tracking_roi = None
+        self.latest_ring_measurement = None
+        self.camera_last_analysis_ts = 0.0
+        self.camera_last_metrics_update_ts = 0.0
+        self.update_camera_button_state()
+        self.update_ring_metrics_label()
+        if self.camera_capture is not None:
+            color_name = self.get_camera_ring_color_profile()["status_name"]
+            self.set_camera_status_text(
+                f"Camera: ring color changed to {color_name}; waiting for detection"
+            )
+
     def update_camera_button_state(self):
         camera_open = self.camera_capture is not None
         if CV2_AVAILABLE:
@@ -623,12 +824,7 @@ class ClampSimulatorApp(QMainWindow):
         resolution_text = self.camera_resolution_combo.currentText()
         frame_width, frame_height = [int(token) for token in resolution_text.split("x")]
 
-        reference_text = self.in_camera_reference_diameter.text().strip()
-        reference_diameter_mm = None
-        if reference_text:
-            reference_diameter_mm = float(reference_text)
-            if reference_diameter_mm <= 0:
-                raise ValueError("Known Ring OD [mm]는 0보다 커야 합니다.")
+        reference_diameter_mm = self.get_camera_reference_diameter_value()
 
         return {
             "camera_index": camera_index,
@@ -636,6 +832,29 @@ class ClampSimulatorApp(QMainWindow):
             "frame_height": frame_height,
             "reference_diameter_mm": reference_diameter_mm,
         }
+
+    def camera_capture_loop(self):
+        local_failures = 0
+        while not self.camera_capture_stop_event.is_set():
+            capture = self.camera_capture
+            if capture is None:
+                break
+
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                local_failures += 1
+                self.camera_read_failures = local_failures
+                time.sleep(0.005)
+                continue
+
+            local_failures = 0
+            self.camera_read_failures = 0
+            with self.camera_frame_lock:
+                self.camera_latest_frame = frame
+                self.camera_latest_frame_id += 1
+                self.camera_latest_frame_timestamp = time.monotonic()
+
+        self.camera_read_failures = local_failures
 
     def toggle_camera(self):
         if self.camera_capture is None:
@@ -658,16 +877,36 @@ class ClampSimulatorApp(QMainWindow):
             capture.release()
             raise RuntimeError(f"Camera index {config['camera_index']}를 열 수 없습니다.")
 
+        if hasattr(cv2, "CAP_PROP_FOURCC") and hasattr(cv2, "VideoWriter_fourcc"):
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, config["frame_width"])
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, config["frame_height"])
+        if hasattr(cv2, "CAP_PROP_FPS"):
+            capture.set(cv2.CAP_PROP_FPS, 30)
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self.camera_capture = capture
+        self.camera_capture_stop_event.clear()
         self.camera_read_failures = 0
+        self.camera_reference_diameter_mm = config["reference_diameter_mm"]
+        self.camera_tracking_roi = None
+        self.camera_last_analysis_ts = 0.0
+        self.camera_last_metrics_update_ts = 0.0
         self.latest_ring_measurement = None
+        with self.camera_frame_lock:
+            self.camera_latest_frame = None
+            self.camera_latest_frame_id = 0
+            self.camera_processed_frame_id = 0
+            self.camera_latest_frame_timestamp = 0.0
+        self.camera_capture_thread = threading.Thread(
+            target=self.camera_capture_loop,
+            name="camera-capture",
+            daemon=True,
+        )
+        self.camera_capture_thread.start()
         self.camera_timer.start(self.camera_timer_interval_ms)
-        self.lbl_camera_status.setText(
+        self.set_camera_status_text(
             f"Camera: opened UVC index {config['camera_index']} @ {config['frame_width']}x{config['frame_height']}"
         )
         self.set_camera_preview_message("Camera is starting...")
@@ -676,20 +915,34 @@ class ClampSimulatorApp(QMainWindow):
 
     def close_camera(self, reset_status=True):
         self.camera_timer.stop()
-        if self.camera_capture is not None:
+        self.camera_capture_stop_event.set()
+        capture = self.camera_capture
+        self.camera_capture = None
+        if capture is not None:
             try:
-                self.camera_capture.release()
+                capture.release()
             except Exception:
                 pass
+        if self.camera_capture_thread is not None:
+            self.camera_capture_thread.join(timeout=1.0)
+        self.camera_capture_thread = None
 
-        self.camera_capture = None
+        with self.camera_frame_lock:
+            self.camera_latest_frame = None
+            self.camera_latest_frame_id = 0
+            self.camera_processed_frame_id = 0
+            self.camera_latest_frame_timestamp = 0.0
         self.camera_read_failures = 0
+        self.camera_reference_diameter_mm = None
+        self.camera_tracking_roi = None
+        self.camera_last_analysis_ts = 0.0
+        self.camera_last_metrics_update_ts = 0.0
         self.latest_ring_measurement = None
         if reset_status:
             if CV2_AVAILABLE:
-                self.lbl_camera_status.setText("Camera: closed")
+                self.set_camera_status_text("Camera: closed")
             else:
-                self.lbl_camera_status.setText(f"Camera: OpenCV import failed - {CV2_IMPORT_ERROR}")
+                self.set_camera_status_text(f"Camera: OpenCV import failed - {CV2_IMPORT_ERROR}")
         self.set_camera_preview_message("Camera preview is not running.")
         self.update_ring_metrics_label()
         self.update_camera_button_state()
@@ -699,9 +952,9 @@ class ClampSimulatorApp(QMainWindow):
         self.update_ring_metrics_label()
         self.update_camera_button_state()
         if self.camera_capture is not None:
-            self.lbl_camera_status.setText("Camera: running, baseline cleared")
+            self.set_camera_status_text("Camera: running, baseline cleared")
         else:
-            self.lbl_camera_status.setText("Camera: baseline cleared")
+            self.set_camera_status_text("Camera: baseline cleared")
 
     def capture_ring_baseline(self):
         if self.latest_ring_measurement is None:
@@ -717,7 +970,7 @@ class ClampSimulatorApp(QMainWindow):
             "reference_diameter_mm": measurement.get("reference_diameter_mm"),
             "mm_per_px": measurement.get("mm_per_px"),
         }
-        self.lbl_camera_status.setText("Camera: baseline captured from current ring shape")
+        self.set_camera_status_text("Camera: baseline captured from current ring shape")
         self.update_ring_metrics_label()
         self.update_camera_button_state()
 
@@ -725,50 +978,244 @@ class ClampSimulatorApp(QMainWindow):
         if self.camera_capture is None:
             return
 
-        ok, frame = self.camera_capture.read()
-        if not ok or frame is None:
-            self.camera_read_failures += 1
+        frame = None
+        frame_id = self.camera_processed_frame_id
+        with self.camera_frame_lock:
+            latest_frame = self.camera_latest_frame
+            latest_frame_id = self.camera_latest_frame_id
+            latest_frame_timestamp = self.camera_latest_frame_timestamp
+            if latest_frame is not None and latest_frame_id != self.camera_processed_frame_id:
+                frame = latest_frame
+                frame_id = latest_frame_id
+                self.camera_processed_frame_id = latest_frame_id
+
+        if frame is None:
             if self.camera_read_failures >= 5:
-                self.lbl_camera_status.setText("Camera: frame read failed. Check the UVC device connection.")
+                self.set_camera_status_text("Camera: frame read failed. Check the UVC device connection.")
             return
 
-        self.camera_read_failures = 0
-        try:
-            measurement = self.measure_ring_from_frame(frame)
-        except Exception as exc:
-            self.lbl_camera_status.setText(f"Camera: measurement failed - {exc}")
-            measurement = None
-        self.latest_ring_measurement = measurement
+        now = time.monotonic()
+        measurement = self.latest_ring_measurement
+        should_analyze = (
+            measurement is None
+            or self.camera_last_analysis_ts == 0.0
+            or (now - self.camera_last_analysis_ts) >= (self.camera_analysis_interval_ms / 1000.0)
+        )
+        if should_analyze:
+            try:
+                self.camera_reference_diameter_mm = self.get_camera_reference_diameter_value()
+                measurement = self.measure_ring_from_frame(frame)
+            except Exception as exc:
+                self.set_camera_status_text(f"Camera: measurement failed - {exc}")
+                measurement = None
+            self.latest_ring_measurement = measurement
+            self.camera_last_analysis_ts = now
 
-        display_frame = frame.copy()
-        display_frame = self.draw_ring_measurement_overlay(display_frame, measurement)
+        display_frame = self.draw_ring_measurement_overlay(frame, measurement)
         self.render_camera_frame(display_frame)
-        self.update_ring_metrics_label()
-        self.update_camera_button_state()
+        if should_analyze or (now - self.camera_last_metrics_update_ts) >= (self.camera_metrics_update_interval_ms / 1000.0):
+            self.update_ring_metrics_label()
+            self.camera_last_metrics_update_ts = now
 
-        if measurement is None:
-            self.lbl_camera_status.setText("Camera: running, but the ring was not detected")
+        baseline_ready = self.camera_capture is not None and self.latest_ring_measurement is not None
+        if self.btn_camera_baseline.isEnabled() != baseline_ready:
+            self.btn_camera_baseline.setEnabled(baseline_ready)
+
+        target_description = self.get_camera_ring_target_description()
+        if self.latest_ring_measurement is None:
+            self.set_camera_status_text(
+                f"Camera: running, but the {target_description} was not detected"
+            )
         elif self.camera_baseline is not None:
-            self.lbl_camera_status.setText("Camera: running, ring detected, baseline active")
+            self.set_camera_status_text(
+                f"Camera: running, {target_description} detected, baseline active"
+            )
         else:
-            self.lbl_camera_status.setText("Camera: running, ring detected")
+            self.set_camera_status_text(f"Camera: running, {target_description} detected")
 
-    def measure_ring_from_frame(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        edges = cv2.Canny(blurred, 40, 120)
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    def build_camera_tracking_roi(self, measurement, frame_shape):
+        frame_height, frame_width = frame_shape[:2]
+        center_x, center_y = measurement["center"]
+        half_span = 0.5 * max(measurement["major_px"], measurement["minor_px"])
+        padding = max(40, int(half_span * 0.9))
 
-        contours_info = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        x0 = max(0, int(center_x - half_span - padding))
+        y0 = max(0, int(center_y - half_span - padding))
+        x1 = min(frame_width, int(center_x + half_span + padding))
+        y1 = min(frame_height, int(center_y + half_span + padding))
+
+        if (x1 - x0) < 20 or (y1 - y0) < 20:
+            return None
+        return (x0, y0, x1, y1)
+
+    def get_camera_analysis_view(self, frame, use_tracking_roi=True):
+        offset_x = 0
+        offset_y = 0
+        roi_used = False
+        analysis_frame = frame
+
+        if use_tracking_roi and self.camera_tracking_roi is not None:
+            x0, y0, x1, y1 = self.camera_tracking_roi
+            if (x1 - x0) >= 20 and (y1 - y0) >= 20:
+                analysis_frame = frame[y0:y1, x0:x1]
+                offset_x = x0
+                offset_y = y0
+                roi_used = True
+
+        scale = 1.0
+        analysis_height, analysis_width = analysis_frame.shape[:2]
+        if analysis_width > self.camera_analysis_max_width:
+            scale = self.camera_analysis_max_width / float(analysis_width)
+            resized_width = max(1, int(round(analysis_width * scale)))
+            resized_height = max(1, int(round(analysis_height * scale)))
+            analysis_frame = cv2.resize(
+                analysis_frame,
+                (resized_width, resized_height),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        return analysis_frame, offset_x, offset_y, scale, roi_used
+
+    @staticmethod
+    def map_camera_ellipse_to_frame(ellipse, offset_x, offset_y, scale_factor):
+        (center_x, center_y), (axis_a, axis_b), angle = ellipse
+        return (
+            (float(center_x * scale_factor + offset_x), float(center_y * scale_factor + offset_y)),
+            (float(axis_a * scale_factor), float(axis_b * scale_factor)),
+            float(angle),
+        )
+
+    def build_ring_color_mask(self, analysis_frame):
+        profile = self.get_camera_ring_color_profile()
+        mode = profile["mode"]
+
+        hsv_frame = cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2HSV)
+        color_mask = None
+
+        if mode in {"neutral", "dark-neutral"}:
+            lab_frame = cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2LAB)
+            saturation = hsv_frame[:, :, 1]
+            value = hsv_frame[:, :, 2]
+            a_channel = lab_frame[:, :, 1].astype(np.int16)
+            b_channel = lab_frame[:, :, 2].astype(np.int16)
+
+            color_mask = (
+                (saturation <= profile["s_max"])
+                & (np.abs(a_channel - 128) <= profile["neutral_tol"])
+                & (np.abs(b_channel - 128) <= profile["neutral_tol"])
+            )
+            if mode == "neutral":
+                dynamic_value_floor = min(
+                    profile["v_floor_ceiling"],
+                    max(
+                        profile["v_min"],
+                        int(np.percentile(value, profile["v_floor_percentile"])),
+                    ),
+                )
+                color_mask &= value >= dynamic_value_floor
+            else:
+                color_mask &= value <= profile["v_max"]
+            color_mask = color_mask.astype(np.uint8) * 255
+        else:
+            color_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+            for lower_bound, upper_bound in profile["ranges"]:
+                lower = np.array(lower_bound, dtype=np.uint8)
+                upper = np.array(upper_bound, dtype=np.uint8)
+                color_mask = cv2.bitwise_or(color_mask, cv2.inRange(hsv_frame, lower, upper))
+
+        color_mask = cv2.morphologyEx(
+            color_mask,
+            cv2.MORPH_OPEN,
+            self.camera_morph_kernel,
+            iterations=1,
+        )
+        color_mask = cv2.morphologyEx(
+            color_mask,
+            cv2.MORPH_CLOSE,
+            self.camera_morph_kernel,
+            iterations=2,
+        )
+        return color_mask
+
+    @staticmethod
+    def calculate_ellipse_fit_error(contour, ellipse):
+        (center_x, center_y), (axis_a, axis_b), angle = ellipse
+        semi_major = max(float(axis_a) * 0.5, 1e-6)
+        semi_minor = max(float(axis_b) * 0.5, 1e-6)
+
+        points = contour.reshape(-1, 2).astype(np.float32)
+        translated_x = points[:, 0] - float(center_x)
+        translated_y = points[:, 1] - float(center_y)
+
+        angle_rad = np.deg2rad(float(angle))
+        cos_theta = np.cos(angle_rad)
+        sin_theta = np.sin(angle_rad)
+        rotated_x = translated_x * cos_theta + translated_y * sin_theta
+        rotated_y = -translated_x * sin_theta + translated_y * cos_theta
+
+        normalized_radius = np.sqrt((rotated_x / semi_major) ** 2 + (rotated_y / semi_minor) ** 2)
+        return float(np.mean(np.abs(normalized_radius - 1.0)))
+
+    def get_ring_candidate_silver_metrics(self, silver_mask, ellipse):
+        mask_shape = silver_mask.shape
+        (center_x, center_y), (axis_a, axis_b), angle = ellipse
+        center = (int(round(center_x)), int(round(center_y)))
+        outer_size = (
+            max(1, int(round(axis_a))),
+            max(1, int(round(axis_b))),
+        )
+        band_inner_size = (
+            max(1, int(round(outer_size[0] * self.camera_ring_band_inner_scale))),
+            max(1, int(round(outer_size[1] * self.camera_ring_band_inner_scale))),
+        )
+        hole_size = (
+            max(1, int(round(outer_size[0] * self.camera_ring_hole_probe_scale))),
+            max(1, int(round(outer_size[1] * self.camera_ring_hole_probe_scale))),
+        )
+
+        outer_mask = np.zeros(mask_shape, dtype=np.uint8)
+        band_inner_mask = np.zeros(mask_shape, dtype=np.uint8)
+        hole_mask = np.zeros(mask_shape, dtype=np.uint8)
+
+        cv2.ellipse(outer_mask, (center, outer_size, float(angle)), 255, -1)
+        cv2.ellipse(band_inner_mask, (center, band_inner_size, float(angle)), 255, -1)
+        cv2.ellipse(hole_mask, (center, hole_size, float(angle)), 255, -1)
+
+        band_mask = cv2.subtract(outer_mask, band_inner_mask)
+        band_pixels = cv2.countNonZero(band_mask)
+        band_silver_ratio = 0.0
+        if band_pixels > 0:
+            band_silver_pixels = cv2.countNonZero(cv2.bitwise_and(silver_mask, band_mask))
+            band_silver_ratio = band_silver_pixels / band_pixels
+
+        hole_pixels = cv2.countNonZero(hole_mask)
+        hole_silver_ratio = 0.0
+        if hole_pixels > 0:
+            hole_silver_pixels = cv2.countNonZero(cv2.bitwise_and(silver_mask, hole_mask))
+            hole_silver_ratio = hole_silver_pixels / hole_pixels
+
+        return float(band_silver_ratio), float(hole_silver_ratio)
+
+    def measure_ring_from_frame(self, frame, use_tracking_roi=True):
+        analysis_frame, offset_x, offset_y, scale, roi_used = self.get_camera_analysis_view(
+            frame,
+            use_tracking_roi=use_tracking_roi,
+        )
+        color_mask = self.build_ring_color_mask(analysis_frame)
+
+        contours_info = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
         if not contours:
+            if roi_used:
+                self.camera_tracking_roi = None
+                return self.measure_ring_from_frame(frame, use_tracking_roi=False)
+            self.camera_tracking_roi = None
             return None
 
-        frame_height, frame_width = gray.shape
+        frame_height, frame_width = frame.shape[:2]
         frame_area = frame_height * frame_width
         frame_center = np.array([frame_width / 2.0, frame_height / 2.0], dtype=np.float32)
+        scale_factor = 1.0 / scale
 
         best_candidate = None
         best_score = None
@@ -776,33 +1223,64 @@ class ClampSimulatorApp(QMainWindow):
             if len(contour) < 20:
                 continue
 
-            area = cv2.contourArea(contour)
+            area = cv2.contourArea(contour) * (scale_factor ** 2)
             if area < frame_area * 0.01:
                 continue
 
+            perimeter = cv2.arcLength(contour, True) * scale_factor
+            if perimeter <= 0:
+                continue
+            circularity = float((4.0 * np.pi * area) / max(perimeter * perimeter, 1e-6))
+            if circularity < self.camera_ring_min_circularity:
+                continue
+
             try:
-                ellipse = cv2.fitEllipse(contour)
+                fitted_ellipse = cv2.fitEllipse(contour)
             except cv2.error:
                 continue
 
+            ellipse_fit_error = self.calculate_ellipse_fit_error(contour, fitted_ellipse)
+            if ellipse_fit_error > self.camera_ring_max_ellipse_error:
+                continue
+
+            band_silver_ratio, hole_silver_ratio = self.get_ring_candidate_silver_metrics(
+                color_mask,
+                fitted_ellipse,
+            )
+            if band_silver_ratio < self.camera_ring_min_band_silver_ratio:
+                continue
+            if (band_silver_ratio - hole_silver_ratio) < self.camera_ring_min_band_hole_gap:
+                continue
+
+            ellipse = self.map_camera_ellipse_to_frame(fitted_ellipse, offset_x, offset_y, scale_factor)
             (center_x, center_y), (axis_a, axis_b), angle = ellipse
             major_px, minor_px = sorted([float(axis_a), float(axis_b)], reverse=True)
             if major_px <= 10 or minor_px <= 10:
                 continue
-            if minor_px / max(major_px, 1e-6) < 0.35:
+            axis_ratio = minor_px / max(major_px, 1e-6)
+            if axis_ratio < self.camera_ring_min_axis_ratio:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
+            x = int(round(x * scale_factor + offset_x))
+            y = int(round(y * scale_factor + offset_y))
+            w = int(round(w * scale_factor))
+            h = int(round(h * scale_factor))
             if x <= 1 or y <= 1 or (x + w) >= (frame_width - 1) or (y + h) >= (frame_height - 1):
                 continue
 
             ellipse_area = np.pi * (major_px * 0.5) * (minor_px * 0.5)
             fill_ratio = area / max(ellipse_area, 1.0)
-            if fill_ratio < 0.35 or fill_ratio > 1.35:
+            if fill_ratio < 0.55 or fill_ratio > 1.10:
                 continue
 
             center_distance = float(np.linalg.norm(np.array([center_x, center_y]) - frame_center))
-            score = area - (center_distance * 1.5)
+            silver_gap = band_silver_ratio - hole_silver_ratio
+            score = (
+                area * (1.0 + band_silver_ratio + silver_gap)
+                - (center_distance * 2.0)
+                - (ellipse_fit_error * area * 0.5)
+            )
             if best_score is None or score > best_score:
                 best_score = score
                 best_candidate = {
@@ -813,9 +1291,18 @@ class ClampSimulatorApp(QMainWindow):
                     "minor_px": minor_px,
                     "area": float(area),
                     "fill_ratio": float(fill_ratio),
+                    "axis_ratio": float(axis_ratio),
+                    "circularity": float(circularity),
+                    "ellipse_fit_error": float(ellipse_fit_error),
+                    "band_silver_ratio": float(band_silver_ratio),
+                    "hole_silver_ratio": float(hole_silver_ratio),
                 }
 
         if best_candidate is None:
+            if roi_used:
+                self.camera_tracking_roi = None
+                return self.measure_ring_from_frame(frame, use_tracking_roi=False)
+            self.camera_tracking_roi = None
             return None
 
         mean_px = 0.5 * (best_candidate["major_px"] + best_candidate["minor_px"])
@@ -824,7 +1311,7 @@ class ClampSimulatorApp(QMainWindow):
             **best_candidate,
             "mean_px": float(mean_px),
             "ovality_px": float(ovality_px),
-            "reference_diameter_mm": self.get_camera_config()["reference_diameter_mm"],
+            "reference_diameter_mm": self.camera_reference_diameter_mm,
         }
 
         mm_per_px = None
@@ -852,13 +1339,15 @@ class ClampSimulatorApp(QMainWindow):
                 measurement["delta_ovality_mm"] = measurement["delta_ovality_px"] * mm_per_px
                 measurement["deformation_mm"] = abs(measurement["delta_minor_mm"])
 
+        self.camera_tracking_roi = self.build_camera_tracking_roi(measurement, frame.shape)
         return measurement
 
     def draw_ring_measurement_overlay(self, frame, measurement):
         if measurement is None:
+            target_description = self.get_camera_ring_target_description().capitalize()
             cv2.putText(
                 frame,
-                "Ring not detected",
+                f"{target_description} not detected",
                 (20, 35),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
@@ -903,27 +1392,48 @@ class ClampSimulatorApp(QMainWindow):
         return frame
 
     def render_camera_frame(self, frame):
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        height, width, channels = rgb_frame.shape
-        bytes_per_line = channels * width
-        image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+        preview_width = max(1, self.lbl_camera_preview.width())
+        preview_height = max(1, self.lbl_camera_preview.height())
+        height, width = frame.shape[:2]
+        preview_scale = min(preview_width / max(width, 1), preview_height / max(height, 1), 1.0)
+        if preview_scale < 0.995:
+            resized_width = max(1, int(round(width * preview_scale)))
+            resized_height = max(1, int(round(height * preview_scale)))
+            frame = cv2.resize(
+                frame,
+                (resized_width, resized_height),
+                interpolation=cv2.INTER_AREA,
+            )
+            height, width = frame.shape[:2]
+
+        bytes_per_line = frame.shape[2] * width
+        bgr_format = getattr(QImage, "Format_BGR888", None)
+        if bgr_format is not None:
+            image = QImage(frame.data, width, height, bytes_per_line, bgr_format).copy()
+        else:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = QImage(
+                rgb_frame.data,
+                width,
+                height,
+                rgb_frame.shape[2] * width,
+                QImage.Format_RGB888,
+            ).copy()
         pixmap = QPixmap.fromImage(image)
-        scaled_pixmap = pixmap.scaled(
-            self.lbl_camera_preview.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.lbl_camera_preview.setPixmap(scaled_pixmap)
+        self.lbl_camera_preview.setPixmap(pixmap)
 
     def update_ring_metrics_label(self):
         if self.latest_ring_measurement is None:
             baseline_text = "captured" if self.camera_baseline is not None else "not captured"
-            self.lbl_ring_metrics.setText(
+            target_description = self.get_camera_ring_target_description()
+            metrics_text = (
                 "Ring measurement:\n"
-                "- Detection: waiting for a visible ring contour\n"
+                f"- Detection: waiting for a centered {target_description}\n"
                 f"- Baseline: {baseline_text}\n"
-                "- Tip: center the ring and use a plain background for stable detection"
+                f"- Tip: {self.get_camera_ring_color_tip()}"
             )
+            if self.lbl_ring_metrics.text() != metrics_text:
+                self.lbl_ring_metrics.setText(metrics_text)
             return
 
         measurement = self.latest_ring_measurement
@@ -958,7 +1468,9 @@ class ClampSimulatorApp(QMainWindow):
                 lines.append(f"- Delta Minor Axis: {measurement['delta_minor_mm']:+.3f} mm")
                 lines.append(f"- Deformation Amount: {measurement['deformation_mm']:.3f} mm")
 
-        self.lbl_ring_metrics.setText("\n".join(lines))
+        metrics_text = "\n".join(lines)
+        if self.lbl_ring_metrics.text() != metrics_text:
+            self.lbl_ring_metrics.setText(metrics_text)
 
     def append_camera_metrics_to_log_row(self, log_row):
         measurement = self.latest_ring_measurement
@@ -1089,7 +1601,7 @@ class ClampSimulatorApp(QMainWindow):
         self.sensor_zeros = [0.0] * 6
         self.update_table_headers()
         self.update_table()
-        self.update_chart()
+        self.update_chart(reset_scale=True)
 
     def update_start_button_idle_state(self):
         if self.is_cdaq_mode():
@@ -1172,7 +1684,7 @@ class ClampSimulatorApp(QMainWindow):
         self.position_zero_offset_mm = 0.0
         self.update_table_headers()
         self.update_table()
-        self.update_chart()
+        self.update_chart(reset_scale=True)
 
         self.update_start_button_idle_state()
 
@@ -1511,6 +2023,7 @@ class ClampSimulatorApp(QMainWindow):
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
         self.update_table_headers()
+        self.chart.reset_scale()
 
         now = datetime.now()
         self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
@@ -1616,7 +2129,7 @@ class ClampSimulatorApp(QMainWindow):
         self.unit = unit
         self.update_table_headers()
         self.update_table()
-        self.update_chart()
+        self.update_chart(reset_scale=True)
 
     def zero_sensors(self):
         # 모든 물리적 데이터, 영점 기준, 그리고 이전 테스트 기록과 시계열 데이터 완전히 리셋
@@ -1666,7 +2179,7 @@ class ClampSimulatorApp(QMainWindow):
 
         self.lbl_status.setText(status_text)
         self.update_table()
-        self.update_chart()
+        self.update_chart(reset_scale=True)
         QMessageBox.information(self, "Zeroed", message_text)
 
     def update_table(self):
@@ -1687,10 +2200,10 @@ class ClampSimulatorApp(QMainWindow):
             data.append(max(0, display_val))
         return data
 
-    def update_chart(self):
+    def update_chart(self, reset_scale=False):
         data = self.get_calibrated_data()
         interp = self.interp_combo.currentText()
-        self.chart.plot_data(data, interpolate_type=interp, unit=self.unit)
+        self.chart.plot_data(data, interpolate_type=interp, unit=self.unit, reset_scale=reset_scale)
 
     def stop_simulation(self, completed=False, source_override=None):
         active_source = source_override if source_override is not None else self.input_source
@@ -1749,6 +2262,7 @@ class ClampSimulatorApp(QMainWindow):
             self.latest_live_position_counts = None
             self.position_zero_offset_mm = 0.0
             self.update_table_headers()
+            self.chart.reset_scale()
             
             now = datetime.now()
             self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
