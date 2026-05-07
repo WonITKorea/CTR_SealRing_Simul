@@ -332,6 +332,11 @@ class ClampSimulatorApp(QMainWindow):
         self.camera_ring_min_band_hole_gap = 0.10
         self.camera_ring_band_inner_scale = 0.70
         self.camera_ring_hole_probe_scale = 0.42
+        self.camera_profile_sample_count = 32
+        self.camera_profile_min_valid_points = 20
+        self.camera_profile_sampling_step_px = 1.5
+        self.camera_profile_min_inner_ratio = 0.12
+        self.camera_profile_min_inner_presence_ratio = 0.60
         self.camera_reference_diameter_mm = None
         self.camera_last_analysis_ts = 0.0
         self.camera_last_metrics_update_ts = 0.0
@@ -701,6 +706,7 @@ class ClampSimulatorApp(QMainWindow):
 
         self.lbl_ring_metrics = QLabel(
             "Ring measurement:\n"
+            "- 32-point profile deformation measurement is enabled.\n"
             "- Select the clamp ring color before opening the camera.\n"
             "- Open the camera and center the ring before baseline capture."
         )
@@ -967,6 +973,11 @@ class ClampSimulatorApp(QMainWindow):
             "minor_px": measurement["minor_px"],
             "mean_px": measurement["mean_px"],
             "ovality_px": measurement["ovality_px"],
+            "profile_point_count": measurement["profile_point_count"],
+            "profile_valid_count": measurement["profile_valid_count"],
+            "profile_outer_radii_px": list(measurement["profile_outer_radii_px"]),
+            "profile_inner_radii_px": list(measurement["profile_inner_radii_px"]),
+            "profile_valid_mask": list(measurement["profile_valid_mask"]),
             "reference_diameter_mm": measurement.get("reference_diameter_mm"),
             "mm_per_px": measurement.get("mm_per_px"),
         }
@@ -1196,16 +1207,113 @@ class ClampSimulatorApp(QMainWindow):
 
         return float(band_silver_ratio), float(hole_silver_ratio)
 
+    def sample_ring_profile(self, component_mask, center):
+        height, width = component_mask.shape
+        center_x, center_y = center
+        max_radius = float(np.hypot(max(center_x, width - center_x), max(center_y, height - center_y)))
+        angles = np.linspace(0.0, 2.0 * np.pi, self.camera_profile_sample_count, endpoint=False)
+
+        outer_radii = []
+        inner_radii = []
+        outer_points = []
+        inner_points = []
+        valid_mask = []
+
+        radii = np.arange(0.0, max_radius + self.camera_profile_sampling_step_px, self.camera_profile_sampling_step_px)
+        for angle in angles:
+            cos_theta = np.cos(angle)
+            sin_theta = np.sin(angle)
+            sample_x = np.clip(np.rint(center_x + cos_theta * radii).astype(np.int32), 0, width - 1)
+            sample_y = np.clip(np.rint(center_y + sin_theta * radii).astype(np.int32), 0, height - 1)
+            mask_hits = component_mask[sample_y, sample_x] > 0
+            hit_indices = np.flatnonzero(mask_hits)
+            if hit_indices.size == 0:
+                outer_radii.append(None)
+                inner_radii.append(None)
+                outer_points.append(None)
+                inner_points.append(None)
+                valid_mask.append(False)
+                continue
+
+            first_idx = int(hit_indices[0])
+            last_idx = int(hit_indices[-1])
+            inner_radius = float(radii[first_idx])
+            outer_radius = float(radii[last_idx])
+            inner_point = (
+                float(center_x + cos_theta * inner_radius),
+                float(center_y + sin_theta * inner_radius),
+            )
+            outer_point = (
+                float(center_x + cos_theta * outer_radius),
+                float(center_y + sin_theta * outer_radius),
+            )
+            inner_radii.append(inner_radius)
+            outer_radii.append(outer_radius)
+            inner_points.append(inner_point)
+            outer_points.append(outer_point)
+            valid_mask.append(True)
+
+        valid_outer_radii = np.array([radius for radius in outer_radii if radius is not None], dtype=np.float32)
+        valid_inner_radii = np.array([radius for radius in inner_radii if radius is not None], dtype=np.float32)
+        valid_count = int(sum(valid_mask))
+        coverage = valid_count / float(self.camera_profile_sample_count)
+
+        inner_ratio = 0.0
+        inner_presence_ratio = 0.0
+        thickness_mean_px = None
+        thickness_range_px = None
+        radius_spread_px = None
+        if valid_count > 0:
+            median_outer_radius = float(np.median(valid_outer_radii))
+            inner_threshold = max(3.0, median_outer_radius * self.camera_profile_min_inner_ratio)
+            inner_present = valid_inner_radii >= inner_threshold
+            inner_presence_ratio = float(np.mean(inner_present))
+            inner_ratio = float(np.median(valid_inner_radii / np.maximum(valid_outer_radii, 1e-6)))
+            thickness_values = valid_outer_radii - valid_inner_radii
+            thickness_mean_px = float(np.mean(thickness_values))
+            thickness_range_px = float(np.max(thickness_values) - np.min(thickness_values))
+            radius_spread_px = float(np.max(valid_outer_radii) - np.min(valid_outer_radii))
+
+        return {
+            "angles_rad": angles.tolist(),
+            "outer_radii_px": outer_radii,
+            "inner_radii_px": inner_radii,
+            "outer_points": outer_points,
+            "inner_points": inner_points,
+            "valid_mask": valid_mask,
+            "valid_count": valid_count,
+            "coverage": float(coverage),
+            "inner_ratio": float(inner_ratio),
+            "inner_presence_ratio": float(inner_presence_ratio),
+            "thickness_mean_px": thickness_mean_px,
+            "thickness_range_px": thickness_range_px,
+            "radius_spread_px": radius_spread_px,
+        }
+
+    @staticmethod
+    def map_camera_points_to_frame(points, offset_x, offset_y, scale_factor):
+        mapped_points = []
+        for point in points:
+            if point is None:
+                mapped_points.append(None)
+                continue
+            point_x, point_y = point
+            mapped_points.append(
+                (
+                    float(point_x * scale_factor + offset_x),
+                    float(point_y * scale_factor + offset_y),
+                )
+            )
+        return mapped_points
+
     def measure_ring_from_frame(self, frame, use_tracking_roi=True):
         analysis_frame, offset_x, offset_y, scale, roi_used = self.get_camera_analysis_view(
             frame,
             use_tracking_roi=use_tracking_roi,
         )
         color_mask = self.build_ring_color_mask(analysis_frame)
-
-        contours_info = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
-        if not contours:
+        label_count, labels, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+        if label_count <= 1:
             if roi_used:
                 self.camera_tracking_roi = None
                 return self.measure_ring_from_frame(frame, use_tracking_roi=False)
@@ -1219,83 +1327,137 @@ class ClampSimulatorApp(QMainWindow):
 
         best_candidate = None
         best_score = None
-        for contour in contours:
-            if len(contour) < 20:
+        for label_index in range(1, label_count):
+            component_area_px = int(stats[label_index, cv2.CC_STAT_AREA])
+            area = component_area_px * (scale_factor ** 2)
+            if area < frame_area * 0.003:
                 continue
 
-            area = cv2.contourArea(contour) * (scale_factor ** 2)
-            if area < frame_area * 0.01:
+            component_x = int(stats[label_index, cv2.CC_STAT_LEFT])
+            component_y = int(stats[label_index, cv2.CC_STAT_TOP])
+            component_w = int(stats[label_index, cv2.CC_STAT_WIDTH])
+            component_h = int(stats[label_index, cv2.CC_STAT_HEIGHT])
+            mapped_x = int(round(component_x * scale_factor + offset_x))
+            mapped_y = int(round(component_y * scale_factor + offset_y))
+            mapped_w = int(round(component_w * scale_factor))
+            mapped_h = int(round(component_h * scale_factor))
+            if (
+                mapped_x <= 1
+                or mapped_y <= 1
+                or (mapped_x + mapped_w) >= (frame_width - 1)
+                or (mapped_y + mapped_h) >= (frame_height - 1)
+            ):
+                continue
+
+            component_mask = np.where(labels == label_index, 255, 0).astype(np.uint8)
+            contours_info = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = contours_info[0] if len(contours_info) == 2 else contours_info[1]
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            if len(contour) < 10:
                 continue
 
             perimeter = cv2.arcLength(contour, True) * scale_factor
             if perimeter <= 0:
                 continue
             circularity = float((4.0 * np.pi * area) / max(perimeter * perimeter, 1e-6))
-            if circularity < self.camera_ring_min_circularity:
+            if circularity < 0.08:
                 continue
 
+            (sample_center_x, sample_center_y), enclosing_radius = cv2.minEnclosingCircle(contour)
+            if enclosing_radius <= 10:
+                continue
+
+            profile = self.sample_ring_profile(component_mask, (sample_center_x, sample_center_y))
+            if profile["valid_count"] < self.camera_profile_min_valid_points:
+                continue
+            if profile["inner_presence_ratio"] < self.camera_profile_min_inner_presence_ratio:
+                continue
+            if profile["inner_ratio"] < self.camera_profile_min_inner_ratio:
+                continue
+
+            fitted_ellipse = None
+            ellipse_fit_error = 0.0
             try:
                 fitted_ellipse = cv2.fitEllipse(contour)
+                ellipse_fit_error = self.calculate_ellipse_fit_error(contour, fitted_ellipse)
             except cv2.error:
+                fitted_ellipse = None
+
+            if fitted_ellipse is not None and ellipse_fit_error > 0.35:
                 continue
 
-            ellipse_fit_error = self.calculate_ellipse_fit_error(contour, fitted_ellipse)
-            if ellipse_fit_error > self.camera_ring_max_ellipse_error:
-                continue
-
-            band_silver_ratio, hole_silver_ratio = self.get_ring_candidate_silver_metrics(
-                color_mask,
-                fitted_ellipse,
+            outer_radii = np.array(
+                [radius for radius in profile["outer_radii_px"] if radius is not None],
+                dtype=np.float32,
             )
-            if band_silver_ratio < self.camera_ring_min_band_silver_ratio:
-                continue
-            if (band_silver_ratio - hole_silver_ratio) < self.camera_ring_min_band_hole_gap:
-                continue
-
-            ellipse = self.map_camera_ellipse_to_frame(fitted_ellipse, offset_x, offset_y, scale_factor)
-            (center_x, center_y), (axis_a, axis_b), angle = ellipse
-            major_px, minor_px = sorted([float(axis_a), float(axis_b)], reverse=True)
-            if major_px <= 10 or minor_px <= 10:
-                continue
+            major_px = float(np.max(outer_radii) * 2.0)
+            minor_px = float(np.min(outer_radii) * 2.0)
+            mean_px = float(np.mean(outer_radii) * 2.0)
+            ovality_px = float(major_px - minor_px)
             axis_ratio = minor_px / max(major_px, 1e-6)
-            if axis_ratio < self.camera_ring_min_axis_ratio:
+            if axis_ratio < 0.35:
                 continue
 
-            x, y, w, h = cv2.boundingRect(contour)
-            x = int(round(x * scale_factor + offset_x))
-            y = int(round(y * scale_factor + offset_y))
-            w = int(round(w * scale_factor))
-            h = int(round(h * scale_factor))
-            if x <= 1 or y <= 1 or (x + w) >= (frame_width - 1) or (y + h) >= (frame_height - 1):
-                continue
+            if fitted_ellipse is not None:
+                ellipse = self.map_camera_ellipse_to_frame(fitted_ellipse, offset_x, offset_y, scale_factor)
+                fill_ratio = area / max(np.pi * (ellipse[1][0] * 0.5) * (ellipse[1][1] * 0.5), 1.0)
+            else:
+                mapped_radius = float(enclosing_radius * scale_factor)
+                ellipse = (
+                    (
+                        float(sample_center_x * scale_factor + offset_x),
+                        float(sample_center_y * scale_factor + offset_y),
+                    ),
+                    (mapped_radius * 2.0, mapped_radius * 2.0),
+                    0.0,
+                )
+                fill_ratio = 1.0
 
-            ellipse_area = np.pi * (major_px * 0.5) * (minor_px * 0.5)
-            fill_ratio = area / max(ellipse_area, 1.0)
-            if fill_ratio < 0.55 or fill_ratio > 1.10:
-                continue
-
+            center_x = float(sample_center_x * scale_factor + offset_x)
+            center_y = float(sample_center_y * scale_factor + offset_y)
             center_distance = float(np.linalg.norm(np.array([center_x, center_y]) - frame_center))
-            silver_gap = band_silver_ratio - hole_silver_ratio
             score = (
-                area * (1.0 + band_silver_ratio + silver_gap)
+                area * (1.0 + profile["coverage"] + profile["inner_presence_ratio"])
                 - (center_distance * 2.0)
-                - (ellipse_fit_error * area * 0.5)
+                - (ellipse_fit_error * area * 0.3)
             )
             if best_score is None or score > best_score:
                 best_score = score
                 best_candidate = {
                     "ellipse": ellipse,
                     "center": (float(center_x), float(center_y)),
-                    "angle": float(angle),
+                    "angle": float(ellipse[2]),
                     "major_px": major_px,
                     "minor_px": minor_px,
+                    "mean_px": mean_px,
+                    "ovality_px": ovality_px,
                     "area": float(area),
                     "fill_ratio": float(fill_ratio),
                     "axis_ratio": float(axis_ratio),
                     "circularity": float(circularity),
                     "ellipse_fit_error": float(ellipse_fit_error),
-                    "band_silver_ratio": float(band_silver_ratio),
-                    "hole_silver_ratio": float(hole_silver_ratio),
+                    "profile_point_count": int(self.camera_profile_sample_count),
+                    "profile_valid_count": int(profile["valid_count"]),
+                    "profile_coverage": float(profile["coverage"]),
+                    "profile_inner_ratio": float(profile["inner_ratio"]),
+                    "profile_inner_presence_ratio": float(profile["inner_presence_ratio"]),
+                    "profile_outer_radii_px": list(profile["outer_radii_px"]),
+                    "profile_inner_radii_px": list(profile["inner_radii_px"]),
+                    "profile_valid_mask": list(profile["valid_mask"]),
+                    "profile_angles_deg": [
+                        float(np.degrees(angle_value)) for angle_value in profile["angles_rad"]
+                    ],
+                    "profile_outer_points": self.map_camera_points_to_frame(
+                        profile["outer_points"], offset_x, offset_y, scale_factor
+                    ),
+                    "profile_inner_points": self.map_camera_points_to_frame(
+                        profile["inner_points"], offset_x, offset_y, scale_factor
+                    ),
+                    "radius_spread_px": profile["radius_spread_px"],
+                    "thickness_mean_px": profile["thickness_mean_px"],
+                    "thickness_range_px": profile["thickness_range_px"],
                 }
 
         if best_candidate is None:
@@ -1305,20 +1467,16 @@ class ClampSimulatorApp(QMainWindow):
             self.camera_tracking_roi = None
             return None
 
-        mean_px = 0.5 * (best_candidate["major_px"] + best_candidate["minor_px"])
-        ovality_px = best_candidate["major_px"] - best_candidate["minor_px"]
         measurement = {
             **best_candidate,
-            "mean_px": float(mean_px),
-            "ovality_px": float(ovality_px),
             "reference_diameter_mm": self.camera_reference_diameter_mm,
         }
 
         mm_per_px = None
         if self.camera_baseline is not None and self.camera_baseline.get("mm_per_px"):
             mm_per_px = self.camera_baseline["mm_per_px"]
-        elif measurement["reference_diameter_mm"] is not None and mean_px > 0:
-            mm_per_px = measurement["reference_diameter_mm"] / mean_px
+        elif measurement["reference_diameter_mm"] is not None and measurement["mean_px"] > 0:
+            mm_per_px = measurement["reference_diameter_mm"] / measurement["mean_px"]
         measurement["mm_per_px"] = mm_per_px
 
         if mm_per_px is not None:
@@ -1326,18 +1484,52 @@ class ClampSimulatorApp(QMainWindow):
             measurement["minor_mm"] = measurement["minor_px"] * mm_per_px
             measurement["mean_mm"] = measurement["mean_px"] * mm_per_px
             measurement["ovality_mm"] = measurement["ovality_px"] * mm_per_px
+            if measurement.get("radius_spread_px") is not None:
+                measurement["radius_spread_mm"] = measurement["radius_spread_px"] * mm_per_px
+            if measurement.get("thickness_mean_px") is not None:
+                measurement["thickness_mean_mm"] = measurement["thickness_mean_px"] * mm_per_px
+            if measurement.get("thickness_range_px") is not None:
+                measurement["thickness_range_mm"] = measurement["thickness_range_px"] * mm_per_px
 
         if self.camera_baseline is not None:
             measurement["delta_major_px"] = measurement["major_px"] - self.camera_baseline["major_px"]
             measurement["delta_minor_px"] = measurement["minor_px"] - self.camera_baseline["minor_px"]
             measurement["delta_mean_px"] = measurement["mean_px"] - self.camera_baseline["mean_px"]
             measurement["delta_ovality_px"] = measurement["ovality_px"] - self.camera_baseline["ovality_px"]
+
+            current_outer = np.array(
+                [np.nan if radius is None else float(radius) for radius in measurement["profile_outer_radii_px"]],
+                dtype=np.float32,
+            )
+            baseline_outer = np.array(
+                [
+                    np.nan if radius is None else float(radius)
+                    for radius in self.camera_baseline["profile_outer_radii_px"]
+                ],
+                dtype=np.float32,
+            )
+            current_valid = np.array(measurement["profile_valid_mask"], dtype=bool)
+            baseline_valid = np.array(self.camera_baseline["profile_valid_mask"], dtype=bool)
+            common_valid = current_valid & baseline_valid
+            measurement["profile_common_valid_count"] = int(np.count_nonzero(common_valid))
+            if measurement["profile_common_valid_count"] > 0:
+                delta_profile_px = current_outer[common_valid] - baseline_outer[common_valid]
+                measurement["profile_delta_mean_abs_px"] = float(np.mean(np.abs(delta_profile_px)))
+                measurement["profile_delta_max_abs_px"] = float(np.max(np.abs(delta_profile_px)))
+                measurement["profile_delta_mean_signed_px"] = float(np.mean(delta_profile_px))
+
             if mm_per_px is not None:
                 measurement["delta_major_mm"] = measurement["delta_major_px"] * mm_per_px
                 measurement["delta_minor_mm"] = measurement["delta_minor_px"] * mm_per_px
                 measurement["delta_mean_mm"] = measurement["delta_mean_px"] * mm_per_px
                 measurement["delta_ovality_mm"] = measurement["delta_ovality_px"] * mm_per_px
-                measurement["deformation_mm"] = abs(measurement["delta_minor_mm"])
+                if measurement.get("profile_delta_mean_abs_px") is not None:
+                    measurement["profile_delta_mean_abs_mm"] = measurement["profile_delta_mean_abs_px"] * mm_per_px
+                    measurement["profile_delta_max_abs_mm"] = measurement["profile_delta_max_abs_px"] * mm_per_px
+                    measurement["profile_delta_mean_signed_mm"] = (
+                        measurement["profile_delta_mean_signed_px"] * mm_per_px
+                    )
+                    measurement["deformation_mm"] = measurement["profile_delta_max_abs_mm"]
 
         self.camera_tracking_roi = self.build_camera_tracking_roi(measurement, frame.shape)
         return measurement
@@ -1357,23 +1549,45 @@ class ClampSimulatorApp(QMainWindow):
             )
             return frame
 
-        cv2.ellipse(frame, measurement["ellipse"], (0, 255, 0), 2)
         center_x, center_y = measurement["center"]
         cv2.circle(frame, (int(center_x), int(center_y)), 4, (255, 0, 0), -1)
 
+        previous_point = None
+        for point in measurement.get("profile_outer_points", []):
+            if point is None:
+                previous_point = None
+                continue
+            point_xy = (int(round(point[0])), int(round(point[1])))
+            cv2.circle(frame, point_xy, 3, (0, 140, 255), -1)
+            if previous_point is not None:
+                cv2.line(frame, previous_point, point_xy, (0, 220, 255), 1, cv2.LINE_AA)
+            previous_point = point_xy
+
+        for point in measurement.get("profile_inner_points", []):
+            if point is None:
+                continue
+            point_xy = (int(round(point[0])), int(round(point[1])))
+            cv2.circle(frame, point_xy, 2, (120, 255, 120), -1)
+
         overlay_lines = [
-            f"Major: {measurement['major_px']:.1f}px",
-            f"Minor: {measurement['minor_px']:.1f}px",
-            f"Ovality: {measurement['ovality_px']:.1f}px",
+            f"Samples: {measurement['profile_valid_count']}/{measurement['profile_point_count']}",
+            f"Mean Dia: {measurement['mean_px']:.1f}px",
+            f"Spread: {measurement['radius_spread_px']:.2f}px" if measurement.get("radius_spread_px") is not None else "Spread: n/a",
         ]
         if measurement.get("major_mm") is not None:
             overlay_lines = [
-                f"Major: {measurement['major_mm']:.3f}mm",
-                f"Minor: {measurement['minor_mm']:.3f}mm",
-                f"Ovality: {measurement['ovality_mm']:.3f}mm",
+                f"Samples: {measurement['profile_valid_count']}/{measurement['profile_point_count']}",
+                f"Mean Dia: {measurement['mean_mm']:.3f}mm",
+                (
+                    f"Spread: {measurement['radius_spread_mm']:.3f}mm"
+                    if measurement.get("radius_spread_mm") is not None
+                    else "Spread: n/a"
+                ),
             ]
-        if measurement.get("deformation_mm") is not None:
-            overlay_lines.append(f"Deformation: {measurement['deformation_mm']:.3f}mm")
+        if measurement.get("profile_delta_max_abs_mm") is not None:
+            overlay_lines.append(f"Max Def.: {measurement['profile_delta_max_abs_mm']:.3f}mm")
+        elif measurement.get("profile_delta_max_abs_px") is not None:
+            overlay_lines.append(f"Max Def.: {measurement['profile_delta_max_abs_px']:.2f}px")
 
         origin_y = 30
         for line in overlay_lines:
@@ -1429,6 +1643,7 @@ class ClampSimulatorApp(QMainWindow):
             metrics_text = (
                 "Ring measurement:\n"
                 f"- Detection: waiting for a centered {target_description}\n"
+                f"- Profile Points: up to {self.camera_profile_sample_count}\n"
                 f"- Baseline: {baseline_text}\n"
                 f"- Tip: {self.get_camera_ring_color_tip()}"
             )
@@ -1439,34 +1654,37 @@ class ClampSimulatorApp(QMainWindow):
         measurement = self.latest_ring_measurement
         lines = [
             "Ring measurement:",
-            f"- Major Axis: {measurement['major_px']:.2f} px",
-            f"- Minor Axis: {measurement['minor_px']:.2f} px",
+            f"- Profile Points: {measurement['profile_valid_count']} / {measurement['profile_point_count']}",
+            f"- Profile Coverage: {measurement['profile_coverage'] * 100.0:.1f} %",
             f"- Mean Diameter: {measurement['mean_px']:.2f} px",
-            f"- Ovality: {measurement['ovality_px']:.2f} px",
+            f"- Diameter Spread: {measurement['ovality_px']:.2f} px",
         ]
         if measurement.get("major_mm") is not None:
             lines.extend(
                 [
-                    f"- Major Axis: {measurement['major_mm']:.3f} mm",
-                    f"- Minor Axis: {measurement['minor_mm']:.3f} mm",
                     f"- Mean Diameter: {measurement['mean_mm']:.3f} mm",
-                    f"- Ovality: {measurement['ovality_mm']:.3f} mm",
+                    f"- Diameter Spread: {measurement['ovality_mm']:.3f} mm",
                 ]
             )
+        if measurement.get("thickness_mean_px") is not None:
+            lines.append(f"- Band Thickness Mean: {measurement['thickness_mean_px']:.2f} px")
+        if measurement.get("thickness_mean_mm") is not None:
+            lines.append(f"- Band Thickness Mean: {measurement['thickness_mean_mm']:.3f} mm")
 
         if self.camera_baseline is None:
             lines.append("- Baseline: not captured")
         else:
             lines.append("- Baseline: captured")
-            if "delta_minor_px" in measurement and "delta_ovality_px" in measurement:
-                lines.append(f"- Delta Minor Axis: {measurement['delta_minor_px']:+.2f} px")
-                lines.append(f"- Delta Ovality: {measurement['delta_ovality_px']:+.2f} px")
+            if measurement.get("profile_common_valid_count"):
+                lines.append(f"- Common Sample Points: {measurement['profile_common_valid_count']}")
+                lines.append(f"- Mean Radial Delta: {measurement['profile_delta_mean_abs_px']:.2f} px")
+                lines.append(f"- Max Radial Delta: {measurement['profile_delta_max_abs_px']:.2f} px")
+                if measurement.get("profile_delta_mean_abs_mm") is not None:
+                    lines.append(f"- Mean Radial Delta: {measurement['profile_delta_mean_abs_mm']:.3f} mm")
+                    lines.append(f"- Max Radial Delta: {measurement['profile_delta_max_abs_mm']:.3f} mm")
+                    lines.append(f"- Deformation Amount: {measurement['deformation_mm']:.3f} mm")
             else:
-                lines.append("- Delta: waiting for the next frame after baseline capture")
-
-            if measurement.get("deformation_mm") is not None:
-                lines.append(f"- Delta Minor Axis: {measurement['delta_minor_mm']:+.3f} mm")
-                lines.append(f"- Deformation Amount: {measurement['deformation_mm']:.3f} mm")
+                lines.append("- Delta: waiting for enough common sample points after baseline capture")
 
         metrics_text = "\n".join(lines)
         if self.lbl_ring_metrics.text() != metrics_text:
@@ -1481,19 +1699,28 @@ class ClampSimulatorApp(QMainWindow):
         log_row["Ring Minor [px]"] = round(measurement["minor_px"], 2)
         log_row["Ring Mean Diameter [px]"] = round(measurement["mean_px"], 2)
         log_row["Ring Ovality [px]"] = round(measurement["ovality_px"], 2)
+        log_row["Ring Profile Points"] = int(measurement["profile_point_count"])
+        log_row["Ring Valid Sample Points"] = int(measurement["profile_valid_count"])
+        log_row["Ring Profile Coverage [%]"] = round(measurement["profile_coverage"] * 100.0, 1)
+        if measurement.get("radius_spread_px") is not None:
+            log_row["Ring Radius Spread [px]"] = round(measurement["radius_spread_px"], 2)
 
         if measurement.get("major_mm") is not None:
             log_row["Ring Major [mm]"] = round(measurement["major_mm"], 3)
             log_row["Ring Minor [mm]"] = round(measurement["minor_mm"], 3)
             log_row["Ring Mean Diameter [mm]"] = round(measurement["mean_mm"], 3)
             log_row["Ring Ovality [mm]"] = round(measurement["ovality_mm"], 3)
+            if measurement.get("radius_spread_mm") is not None:
+                log_row["Ring Radius Spread [mm]"] = round(measurement["radius_spread_mm"], 3)
 
         if self.camera_baseline is not None:
-            if "delta_minor_px" in measurement and "delta_ovality_px" in measurement:
-                log_row["Ring Delta Minor [px]"] = round(measurement["delta_minor_px"], 2)
-                log_row["Ring Delta Ovality [px]"] = round(measurement["delta_ovality_px"], 2)
-            if measurement.get("deformation_mm") is not None:
-                log_row["Ring Delta Minor [mm]"] = round(measurement["delta_minor_mm"], 3)
+            if measurement.get("profile_common_valid_count"):
+                log_row["Ring Common Sample Points"] = int(measurement["profile_common_valid_count"])
+                log_row["Ring Mean Radial Delta [px]"] = round(measurement["profile_delta_mean_abs_px"], 2)
+                log_row["Ring Max Radial Delta [px]"] = round(measurement["profile_delta_max_abs_px"], 2)
+            if measurement.get("profile_delta_mean_abs_mm") is not None:
+                log_row["Ring Mean Radial Delta [mm]"] = round(measurement["profile_delta_mean_abs_mm"], 3)
+                log_row["Ring Max Radial Delta [mm]"] = round(measurement["profile_delta_max_abs_mm"], 3)
                 log_row["Ring Deformation [mm]"] = round(measurement["deformation_mm"], 3)
 
     def is_cdaq_mode(self):
