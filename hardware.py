@@ -282,13 +282,28 @@ class FC400ModbusClient:
         }
 
 
-class MrMc240nPositionMonitor:
-    """Thin ctypes wrapper around Mitsubishi MR-MC200 series API library."""
+class MrMc240nPositionController:
+    """ctypes wrapper for MR-MC200 monitoring and standard-mode axis control."""
 
     DEFAULT_LIBRARY_CANDIDATES = (
         "mc2xxstd_x64.dll",
         "mc2xxstd.dll",
     )
+
+    SSC_BIT_OFF = 0
+    SSC_BIT_ON = 1
+    SSC_DIR_PLUS = 0
+    SSC_DIR_MINUS = 1
+
+    # mc2xxstd.h axis command/status bit numbers.
+    SSC_CMDBIT_AX_SON = 1
+    SSC_STSBIT_AX_RDY = 1
+    SSC_STSBIT_AX_INP = 2
+    SSC_STSBIT_AX_SALM = 6
+    SSC_STSBIT_AX_OP = 9
+    SSC_STSBIT_AX_ZP = 12
+    SSC_STSBIT_AX_OALM = 14
+    SSC_STSBIT_AX_OPF = 15
 
     def __init__(self, board_id, axis_number, dll_path="", auto_start_system=False):
         self.board_id = int(board_id)
@@ -299,10 +314,20 @@ class MrMc240nPositionMonitor:
         self.library = None
         self._is_open = False
         self._system_start_attempted = False
+        self._servo_commanded_on = False
+        self._jog_active = False
 
     @staticmethod
     def is_supported_platform():
         return os.name == "nt"
+
+    def _bind_api(self, name, argtypes):
+        try:
+            function = getattr(self.library, name)
+        except AttributeError:
+            return
+        function.argtypes = argtypes
+        function.restype = ctypes.c_int
 
     def _load_library(self):
         if not self.is_supported_platform():
@@ -333,25 +358,68 @@ class MrMc240nPositionMonitor:
                 "Place mc2xxstd.dll or mc2xxstd_x64.dll beside the program or in PATH."
             ) from load_error
 
-        self.library.sscOpen.argtypes = [ctypes.c_int]
-        self.library.sscOpen.restype = ctypes.c_int
-
-        self.library.sscClose.argtypes = [ctypes.c_int]
-        self.library.sscClose.restype = ctypes.c_int
-
-        self.library.sscGetLastError.argtypes = []
-        self.library.sscGetLastError.restype = ctypes.c_int
-
-        self.library.sscSystemStart.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        self.library.sscSystemStart.restype = ctypes.c_int
-
-        self.library.sscGetCurrentFbPositionFast.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_long),
-        ]
-        self.library.sscGetCurrentFbPositionFast.restype = ctypes.c_int
+        self._bind_api("sscOpen", [ctypes.c_int])
+        self._bind_api("sscClose", [ctypes.c_int])
+        self._bind_api("sscGetLastError", [])
+        self._bind_api("sscSystemStart", [ctypes.c_int, ctypes.c_int, ctypes.c_int])
+        self._bind_api(
+            "sscGetCurrentFbPositionFast",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_long)],
+        )
+        self._bind_api(
+            "sscSetCommandBitSignalEx",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
+        self._bind_api(
+            "sscGetStatusBitSignalEx",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+            ],
+        )
+        self._bind_api(
+            "sscJogStart",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_long,
+                ctypes.c_short,
+                ctypes.c_short,
+                ctypes.c_char,
+            ],
+        )
+        self._bind_api(
+            "sscJogStop",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
+        self._bind_api(
+            "sscIncStart",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_long,
+                ctypes.c_long,
+                ctypes.c_short,
+                ctypes.c_short,
+            ],
+        )
+        self._bind_api(
+            "sscHomeReturnStart",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
+        self._bind_api(
+            "sscDriveStop",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
+        self._bind_api(
+            "sscDriveRapidStop",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
 
     def _raise_api_error(self, action, status_code):
         detailed_error = None
@@ -364,6 +432,23 @@ class MrMc240nPositionMonitor:
         if detailed_error is None:
             raise RuntimeError(f"{action} failed. API status={status_code}.")
         raise RuntimeError(f"{action} failed. API status={status_code}, detail={detailed_error}.")
+
+    def _get_api(self, name):
+        if self.library is None:
+            raise RuntimeError("MR-MC240N API library is not loaded.")
+        try:
+            return getattr(self.library, name)
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"{name} is not available in this MR-MC200 API DLL. "
+                "Install the API library supplied with the current Position Board Utility2."
+            ) from exc
+
+    def _call_api(self, name, *args):
+        self.open()
+        status = self._get_api(name)(*args)
+        if status != 0:
+            self._raise_api_error(name, status)
 
     def open(self):
         self._load_library()
@@ -386,6 +471,8 @@ class MrMc240nPositionMonitor:
         finally:
             self._is_open = False
             self._system_start_attempted = False
+            self._servo_commanded_on = False
+            self._jog_active = False
 
     def ensure_running_if_requested(self):
         if not self.auto_start_system or self._system_start_attempted:
@@ -421,3 +508,138 @@ class MrMc240nPositionMonitor:
                 return int(position.value)
 
         self._raise_api_error("sscGetCurrentFbPositionFast", status)
+
+    @staticmethod
+    def _validate_motion_values(speed, acceleration_ms, deceleration_ms):
+        speed = int(speed)
+        acceleration_ms = int(acceleration_ms)
+        deceleration_ms = int(deceleration_ms)
+        if not 1 <= speed <= 2_147_483_647:
+            raise ValueError("Speed must be between 1 and 2147483647 board speed units.")
+        if not 0 <= acceleration_ms <= 20_000:
+            raise ValueError("Acceleration time must be between 0 and 20000 ms.")
+        if not 0 <= deceleration_ms <= 20_000:
+            raise ValueError("Deceleration time must be between 0 and 20000 ms.")
+        return speed, acceleration_ms, deceleration_ms
+
+    def set_servo_on(self, enabled):
+        bit_value = self.SSC_BIT_ON if enabled else self.SSC_BIT_OFF
+        self._call_api(
+            "sscSetCommandBitSignalEx",
+            self.board_id,
+            self.channel,
+            self.axis_number,
+            self.SSC_CMDBIT_AX_SON,
+            bit_value,
+        )
+        self._servo_commanded_on = bool(enabled)
+        if not enabled:
+            self._jog_active = False
+
+    def get_axis_status_bit(self, bit_number):
+        self.open()
+        bit_status = ctypes.c_int()
+        status = self._get_api("sscGetStatusBitSignalEx")(
+            self.board_id,
+            self.channel,
+            self.axis_number,
+            int(bit_number),
+            ctypes.byref(bit_status),
+        )
+        if status != 0:
+            self._raise_api_error("sscGetStatusBitSignalEx", status)
+        return bool(bit_status.value)
+
+    def read_axis_status(self):
+        status_bits = {
+            "servo_ready": self.SSC_STSBIT_AX_RDY,
+            "in_position": self.SSC_STSBIT_AX_INP,
+            "servo_alarm": self.SSC_STSBIT_AX_SALM,
+            "operating": self.SSC_STSBIT_AX_OP,
+            "home_complete": self.SSC_STSBIT_AX_ZP,
+            "operation_alarm": self.SSC_STSBIT_AX_OALM,
+            "operation_complete": self.SSC_STSBIT_AX_OPF,
+        }
+        return {
+            name: self.get_axis_status_bit(bit_number)
+            for name, bit_number in status_bits.items()
+        }
+
+    def start_jog(self, direction, speed, acceleration_ms, deceleration_ms):
+        speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
+            speed, acceleration_ms, deceleration_ms
+        )
+        if direction not in (self.SSC_DIR_PLUS, self.SSC_DIR_MINUS):
+            raise ValueError("Jog direction must be SSC_DIR_PLUS or SSC_DIR_MINUS.")
+
+        self._call_api(
+            "sscJogStart",
+            self.board_id,
+            self.channel,
+            self.axis_number,
+            speed,
+            acceleration_ms,
+            deceleration_ms,
+            direction,
+        )
+        self._jog_active = True
+
+    def stop_jog(self, timeout_ms=3000):
+        timeout_ms = int(timeout_ms)
+        if not 0 <= timeout_ms <= 65_535:
+            raise ValueError("Stop timeout must be between 0 and 65535 ms.")
+        self._call_api(
+            "sscJogStop",
+            self.board_id,
+            self.channel,
+            self.axis_number,
+            timeout_ms,
+        )
+        self._jog_active = False
+
+    def move_relative(self, distance_counts, speed, acceleration_ms, deceleration_ms):
+        distance_counts = int(distance_counts)
+        if not -2_147_483_647 <= distance_counts <= 2_147_483_647:
+            raise ValueError("Relative distance exceeds the signed 32-bit command range.")
+        if distance_counts == 0:
+            raise ValueError("Relative distance must not be zero.")
+        speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
+            speed, acceleration_ms, deceleration_ms
+        )
+
+        self._call_api(
+            "sscIncStart",
+            self.board_id,
+            self.channel,
+            self.axis_number,
+            distance_counts,
+            speed,
+            acceleration_ms,
+            deceleration_ms,
+        )
+
+    def start_home_return(self):
+        self._call_api(
+            "sscHomeReturnStart",
+            self.board_id,
+            self.channel,
+            self.axis_number,
+        )
+
+    def stop(self, rapid=False, timeout_ms=3000):
+        timeout_ms = int(timeout_ms)
+        if not 0 <= timeout_ms <= 65_535:
+            raise ValueError("Stop timeout must be between 0 and 65535 ms.")
+        api_name = "sscDriveRapidStop" if rapid else "sscDriveStop"
+        self._call_api(
+            api_name,
+            self.board_id,
+            self.channel,
+            self.axis_number,
+            timeout_ms,
+        )
+        self._jog_active = False
+
+
+# Backward-compatible name for integrations that imported the original monitor.
+MrMc240nPositionMonitor = MrMc240nPositionController
