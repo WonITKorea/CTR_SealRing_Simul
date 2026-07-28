@@ -23,7 +23,7 @@ from hardware import (
     FC400_NET_MODE,
     FC400ModbusClient,
     MR_MC240N_WINDOWS_ONLY_MESSAGE,
-    MrMc240nPositionMonitor,
+    MrMc240nPositionController,
     SERIAL_AVAILABLE,
     SERIAL_IMPORT_ERROR,
     list_serial_port_names,
@@ -305,6 +305,7 @@ class ClampSimulatorApp(QMainWindow):
         self.cdaq_task = None
         self.fc400_client = None
         self.position_monitor = None
+        self.position_jog_command_active = False
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
         self.position_zero_offset_mm = 0.0
@@ -590,10 +591,10 @@ class ClampSimulatorApp(QMainWindow):
         group_fc400.setLayout(layout_fc400)
         left_layout.addWidget(group_fc400, 2, 1)
 
-        group_position = QGroupBox("Mitsubishi MR-MC240N Position Monitor")
+        group_position = QGroupBox("MR-MC240N / MR-J4-10B-RJ Position Control")
         layout_position = QGridLayout()
 
-        self.chk_position_monitor = QCheckBox("Enable MR-MC240N feedback position monitor")
+        self.chk_position_monitor = QCheckBox("Enable MR-MC240N position board")
         self.chk_position_monitor.toggled.connect(self.on_position_monitor_toggled)
         if os.name != "nt":
             self.chk_position_monitor.setEnabled(False)
@@ -618,12 +619,81 @@ class ClampSimulatorApp(QMainWindow):
         self.chk_mr_auto_start = QCheckBox("Try sscSystemStart() if the board is not running")
         layout_position.addWidget(self.chk_mr_auto_start, 5, 0, 1, 2)
 
-        mr_status = "MR-MC240N: optional monitor, Windows + Mitsubishi API DLL required"
+        self.chk_mr_motion_arm = QCheckBox("Arm motion commands")
+        self.chk_mr_motion_arm.toggled.connect(self.on_position_motion_arm_toggled)
+        layout_position.addWidget(self.chk_mr_motion_arm, 6, 0, 1, 2)
+
+        layout_position.addWidget(QLabel("Speed [board speed unit]:"), 7, 0)
+        self.in_mr_motion_speed = QLineEdit("100")
+        layout_position.addWidget(self.in_mr_motion_speed, 7, 1)
+
+        layout_position.addWidget(QLabel("Accel / Decel [ms]:"), 8, 0)
+        motion_time_layout = QHBoxLayout()
+        self.in_mr_acceleration_ms = QLineEdit("500")
+        self.in_mr_deceleration_ms = QLineEdit("500")
+        motion_time_layout.addWidget(self.in_mr_acceleration_ms)
+        motion_time_layout.addWidget(self.in_mr_deceleration_ms)
+        layout_position.addLayout(motion_time_layout, 8, 1)
+
+        layout_position.addWidget(QLabel("Relative Move [mm]:"), 9, 0)
+        self.in_mr_relative_move_mm = QLineEdit("1.0")
+        layout_position.addWidget(self.in_mr_relative_move_mm, 9, 1)
+
+        servo_layout = QHBoxLayout()
+        self.btn_mr_servo_on = QPushButton("Servo ON")
+        self.btn_mr_servo_on.clicked.connect(lambda: self.set_position_servo(True))
+        self.btn_mr_servo_off = QPushButton("Servo OFF")
+        self.btn_mr_servo_off.clicked.connect(lambda: self.set_position_servo(False))
+        servo_layout.addWidget(self.btn_mr_servo_on)
+        servo_layout.addWidget(self.btn_mr_servo_off)
+        layout_position.addLayout(servo_layout, 10, 0, 1, 2)
+
+        motion_layout = QHBoxLayout()
+        self.btn_mr_home = QPushButton("Home")
+        self.btn_mr_home.clicked.connect(self.start_position_home)
+        self.btn_mr_move_relative = QPushButton("Move Relative")
+        self.btn_mr_move_relative.clicked.connect(self.start_position_relative_move)
+        motion_layout.addWidget(self.btn_mr_home)
+        motion_layout.addWidget(self.btn_mr_move_relative)
+        layout_position.addLayout(motion_layout, 11, 0, 1, 2)
+
+        jog_layout = QHBoxLayout()
+        self.btn_mr_jog_minus = QPushButton("JOG -")
+        self.btn_mr_jog_minus.pressed.connect(
+            lambda: self.start_position_jog(MrMc240nPositionController.SSC_DIR_MINUS)
+        )
+        self.btn_mr_jog_minus.released.connect(self.stop_position_jog)
+        self.btn_mr_jog_plus = QPushButton("JOG +")
+        self.btn_mr_jog_plus.pressed.connect(
+            lambda: self.start_position_jog(MrMc240nPositionController.SSC_DIR_PLUS)
+        )
+        self.btn_mr_jog_plus.released.connect(self.stop_position_jog)
+        jog_layout.addWidget(self.btn_mr_jog_minus)
+        jog_layout.addWidget(self.btn_mr_jog_plus)
+        layout_position.addLayout(jog_layout, 12, 0, 1, 2)
+
+        stop_layout = QHBoxLayout()
+        self.btn_mr_stop = QPushButton("Stop")
+        self.btn_mr_stop.clicked.connect(lambda: self.stop_position_motion(False))
+        self.btn_mr_rapid_stop = QPushButton("RAPID STOP")
+        self.btn_mr_rapid_stop.clicked.connect(lambda: self.stop_position_motion(True))
+        self.btn_mr_rapid_stop.setStyleSheet(
+            "background-color: #C62828; color: white; font-weight: bold;"
+        )
+        stop_layout.addWidget(self.btn_mr_stop)
+        stop_layout.addWidget(self.btn_mr_rapid_stop)
+        layout_position.addLayout(stop_layout, 13, 0, 1, 2)
+
+        self.btn_mr_refresh_status = QPushButton("Refresh Axis Status")
+        self.btn_mr_refresh_status.clicked.connect(self.refresh_position_axis_status)
+        layout_position.addWidget(self.btn_mr_refresh_status, 14, 0, 1, 2)
+
+        mr_status = "MR-MC240N: Windows + matching Mitsubishi API DLL required"
         if os.name != "nt":
             mr_status = f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}"
         self.lbl_mr_status = QLabel(mr_status)
         self.lbl_mr_status.setWordWrap(True)
-        layout_position.addWidget(self.lbl_mr_status, 6, 0, 1, 2)
+        layout_position.addWidget(self.lbl_mr_status, 15, 0, 1, 2)
 
         group_position.setLayout(layout_position)
         left_layout.addWidget(group_position, 3, 1)
@@ -1735,6 +1805,9 @@ class ClampSimulatorApp(QMainWindow):
     def is_position_monitor_enabled(self):
         return self.chk_position_monitor.isChecked()
 
+    def is_position_control_armed(self):
+        return self.is_position_monitor_enabled() and self.chk_mr_motion_arm.isChecked()
+
     def get_source_data_unit(self):
         if self.is_fc400_mode():
             return self.fc400_device_unit_combo.currentText()
@@ -1794,14 +1867,19 @@ class ClampSimulatorApp(QMainWindow):
         self.on_input_source_changed(source)
 
     def on_position_monitor_toggled(self, enabled):
-        widgets = [
+        configuration_widgets = [
             self.in_mr_dll_path,
             self.in_mr_board_id,
             self.in_mr_axis_no,
             self.in_mr_counts_per_mm,
             self.chk_mr_auto_start,
+            self.chk_mr_motion_arm,
+            self.in_mr_motion_speed,
+            self.in_mr_acceleration_ms,
+            self.in_mr_deceleration_ms,
+            self.in_mr_relative_move_mm,
         ]
-        for widget in widgets:
+        for widget in configuration_widgets:
             widget.setEnabled(enabled)
 
         if enabled:
@@ -1809,14 +1887,60 @@ class ClampSimulatorApp(QMainWindow):
                 self.lbl_mr_status.setText(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
             else:
                 self.lbl_mr_status.setText(
-                    "MR-MC240N: monitoring enabled, board/API DLL will be opened when live monitoring starts"
+                    "MR-MC240N: enabled; board opens on monitoring or control command"
                 )
         else:
+            if self.chk_mr_motion_arm.isChecked():
+                self.chk_mr_motion_arm.setChecked(False)
             self.close_position_monitor()
             if os.name != "nt":
                 self.lbl_mr_status.setText(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
             else:
                 self.lbl_mr_status.setText("MR-MC240N: disabled")
+        self.update_position_control_state()
+
+    def on_position_motion_arm_toggled(self, armed):
+        if armed and not self.is_position_monitor_enabled():
+            self.chk_mr_motion_arm.setChecked(False)
+            return
+
+        if armed:
+            answer = QMessageBox.question(
+                self,
+                "Arm MR-J4 Motion",
+                "MR-MC240N을 통해 MR-J4-10B-RJ 실제 축 명령을 활성화합니다.\n"
+                "외부 비상정지, 리미트 스위치, 작업 영역 안전을 확인했습니까?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.chk_mr_motion_arm.setChecked(False)
+                return
+            self.lbl_mr_status.setText("MR-MC240N: motion commands armed")
+        else:
+            if self.position_jog_command_active:
+                self.stop_position_motion(True)
+            self.position_jog_command_active = False
+            if self.is_position_monitor_enabled():
+                self.lbl_mr_status.setText("MR-MC240N: motion commands disarmed")
+        self.update_position_control_state()
+
+    def update_position_control_state(self):
+        enabled = self.is_position_monitor_enabled() and os.name == "nt"
+        armed = enabled and self.chk_mr_motion_arm.isChecked()
+        motion_buttons = [
+            self.btn_mr_servo_on,
+            self.btn_mr_servo_off,
+            self.btn_mr_home,
+            self.btn_mr_move_relative,
+            self.btn_mr_jog_minus,
+            self.btn_mr_jog_plus,
+        ]
+        for button in motion_buttons:
+            button.setEnabled(armed)
+        self.btn_mr_stop.setEnabled(enabled)
+        self.btn_mr_rapid_stop.setEnabled(enabled)
+        self.btn_mr_refresh_status.setEnabled(enabled)
 
     def on_source_configuration_changed(self, *_args):
         previous_source = getattr(self, "input_source", SIMULATION_SOURCE)
@@ -2151,8 +2275,8 @@ class ClampSimulatorApp(QMainWindow):
 
         if not 0 <= board_id <= 3:
             raise ValueError("MR-MC240N Board ID는 0~3 범위로 입력해주세요.")
-        if axis_number <= 0:
-            raise ValueError("MR-MC240N Axis No는 1 이상이어야 합니다.")
+        if not 1 <= axis_number <= 20:
+            raise ValueError("MR-MC240N + MR-J4 Axis No는 1~20 범위로 입력해주세요.")
         if counts_per_mm <= 0:
             raise ValueError("Command Units / mm는 0보다 커야 합니다.")
 
@@ -2164,6 +2288,26 @@ class ClampSimulatorApp(QMainWindow):
             "auto_start_system": self.chk_mr_auto_start.isChecked(),
         }
 
+    def get_position_motion_config(self):
+        speed = int(self.in_mr_motion_speed.text())
+        acceleration_ms = int(self.in_mr_acceleration_ms.text())
+        deceleration_ms = int(self.in_mr_deceleration_ms.text())
+        distance_mm = float(self.in_mr_relative_move_mm.text())
+
+        if not 1 <= speed <= 2_147_483_647:
+            raise ValueError("Speed는 1~2147483647 board speed unit 범위로 입력해주세요.")
+        if not 0 <= acceleration_ms <= 20_000:
+            raise ValueError("Acceleration은 0~20000 ms 범위로 입력해주세요.")
+        if not 0 <= deceleration_ms <= 20_000:
+            raise ValueError("Deceleration은 0~20000 ms 범위로 입력해주세요.")
+
+        return {
+            "speed": speed,
+            "acceleration_ms": acceleration_ms,
+            "deceleration_ms": deceleration_ms,
+            "distance_mm": distance_mm,
+        }
+
     def open_position_monitor(self):
         if not self.is_position_monitor_enabled():
             return
@@ -2171,7 +2315,7 @@ class ClampSimulatorApp(QMainWindow):
             return
 
         config = self.get_position_monitor_config()
-        monitor = MrMc240nPositionMonitor(
+        monitor = MrMc240nPositionController(
             board_id=config["board_id"],
             axis_number=config["axis_number"],
             dll_path=config["dll_path"],
@@ -2185,17 +2329,23 @@ class ClampSimulatorApp(QMainWindow):
 
         self.position_monitor = monitor
         self.lbl_mr_status.setText(
-            f"MR-MC240N: board {config['board_id']} axis {config['axis_number']} monitor opened"
+            f"MR-MC240N: board {config['board_id']} axis {config['axis_number']} opened"
         )
 
     def close_position_monitor(self):
         if self.position_monitor is None:
             return
         try:
+            if self.position_jog_command_active or self.position_monitor._jog_active:
+                try:
+                    self.position_monitor.stop(rapid=True, timeout_ms=3000)
+                except Exception:
+                    pass
             self.position_monitor.close()
         except Exception:
             pass
         finally:
+            self.position_jog_command_active = False
             self.position_monitor = None
 
     def read_position_feedback(self):
@@ -2216,6 +2366,134 @@ class ClampSimulatorApp(QMainWindow):
         finally:
             if opened_here and not self.is_simulating:
                 self.close_position_monitor()
+
+    def get_position_controller(self, require_armed=True):
+        if not self.is_position_monitor_enabled():
+            raise RuntimeError("MR-MC240N position board를 먼저 활성화해주세요.")
+        if require_armed and not self.is_position_control_armed():
+            raise RuntimeError("Arm motion commands를 먼저 활성화해주세요.")
+        if self.position_monitor is None:
+            self.open_position_monitor()
+        if self.position_monitor is None:
+            raise RuntimeError("MR-MC240N position board를 열지 못했습니다.")
+        return self.position_monitor
+
+    def handle_position_command_error(self, action, exc):
+        message = f"{action} 실패: {exc}"
+        self.lbl_mr_status.setText(f"MR-MC240N: {message}")
+        QMessageBox.critical(self, "MR-MC240N Control Error", message)
+
+    def set_position_servo(self, enabled):
+        action = "Servo ON" if enabled else "Servo OFF"
+        try:
+            controller = self.get_position_controller(require_armed=True)
+            controller.set_servo_on(enabled)
+            self.lbl_mr_status.setText(
+                f"MR-MC240N: {action} command sent to axis {controller.axis_number}"
+            )
+        except Exception as exc:
+            self.handle_position_command_error(action, exc)
+
+    def start_position_home(self):
+        try:
+            controller = self.get_position_controller(require_armed=True)
+            controller.start_home_return()
+            self.lbl_mr_status.setText(
+                f"MR-MC240N: home return started on axis {controller.axis_number}"
+            )
+        except Exception as exc:
+            self.handle_position_command_error("Home return", exc)
+
+    def start_position_relative_move(self):
+        try:
+            controller = self.get_position_controller(require_armed=True)
+            board_config = self.get_position_monitor_config()
+            motion_config = self.get_position_motion_config()
+            distance_counts = round(
+                motion_config["distance_mm"] * board_config["counts_per_mm"]
+            )
+            if distance_counts == 0:
+                raise ValueError(
+                    "Relative Move와 Command Units / mm 조합이 1 command unit 미만입니다."
+                )
+            controller.move_relative(
+                distance_counts,
+                motion_config["speed"],
+                motion_config["acceleration_ms"],
+                motion_config["deceleration_ms"],
+            )
+            self.lbl_mr_status.setText(
+                "MR-MC240N: relative move started "
+                f"({motion_config['distance_mm']:.4f} mm / {distance_counts} command units)"
+            )
+        except Exception as exc:
+            self.handle_position_command_error("Relative move", exc)
+
+    def start_position_jog(self, direction):
+        direction_text = "+" if direction == MrMc240nPositionController.SSC_DIR_PLUS else "-"
+        try:
+            controller = self.get_position_controller(require_armed=True)
+            motion_config = self.get_position_motion_config()
+            controller.start_jog(
+                direction,
+                motion_config["speed"],
+                motion_config["acceleration_ms"],
+                motion_config["deceleration_ms"],
+            )
+            self.position_jog_command_active = True
+            self.lbl_mr_status.setText(f"MR-MC240N: JOG {direction_text} running")
+        except Exception as exc:
+            self.position_jog_command_active = False
+            self.handle_position_command_error(f"JOG {direction_text}", exc)
+
+    def stop_position_jog(self):
+        if not self.position_jog_command_active:
+            return
+        try:
+            controller = self.get_position_controller(require_armed=False)
+            controller.stop_jog()
+            self.lbl_mr_status.setText("MR-MC240N: JOG stopped")
+        except Exception as exc:
+            self.handle_position_command_error("JOG stop", exc)
+        finally:
+            self.position_jog_command_active = False
+
+    def stop_position_motion(self, rapid):
+        action = "Rapid stop" if rapid else "Stop"
+        try:
+            controller = self.get_position_controller(require_armed=False)
+            controller.stop(rapid=rapid)
+            self.position_jog_command_active = False
+            self.lbl_mr_status.setText(f"MR-MC240N: {action} completed")
+        except Exception as exc:
+            self.handle_position_command_error(action, exc)
+
+    def refresh_position_axis_status(self):
+        try:
+            controller = self.get_position_controller(require_armed=False)
+            config = self.get_position_monitor_config()
+            raw_counts = controller.read_feedback_position_counts()
+            position_mm = raw_counts / config["counts_per_mm"] - self.position_zero_offset_mm
+            axis_status = controller.read_axis_status()
+            state_names = [
+                label
+                for key, label in [
+                    ("servo_ready", "READY"),
+                    ("operating", "RUNNING"),
+                    ("in_position", "IN-POS"),
+                    ("home_complete", "HOME"),
+                    ("servo_alarm", "SERVO-ALARM"),
+                    ("operation_alarm", "OP-ALARM"),
+                ]
+                if axis_status[key]
+            ]
+            state_text = ", ".join(state_names) if state_names else "NOT READY"
+            self.lbl_mr_status.setText(
+                f"MR-MC240N axis {controller.axis_number}: {state_text}, "
+                f"{position_mm:.4f} mm ({raw_counts} cmd)"
+            )
+        except Exception as exc:
+            self.handle_position_command_error("Axis status refresh", exc)
 
     def get_default_stroke_mm(self):
         try:

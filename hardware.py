@@ -80,6 +80,27 @@ def _natural_sort_key(text):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
+def get_windows_pe_architecture(file_path):
+    """Return x86/x64 for a PE file, or an empty string when it cannot be read."""
+    try:
+        with open(file_path, "rb") as handle:
+            if handle.read(2) != b"MZ":
+                return ""
+            handle.seek(0x3C)
+            pe_offset = struct.unpack("<I", handle.read(4))[0]
+            handle.seek(pe_offset)
+            if handle.read(4) != b"PE\x00\x00":
+                return ""
+            machine = struct.unpack("<H", handle.read(2))[0]
+    except (OSError, struct.error):
+        return ""
+
+    return {
+        0x014C: "x86",
+        0x8664: "x64",
+    }.get(machine, "")
+
+
 def _to_serial_parity(parity_name):
     mapping = {
         "None": serial.PARITY_NONE,
@@ -345,17 +366,29 @@ class MrMc240nPositionController:
             library_candidates.extend(["mc2xxstd.dll", "mc2xxstd_x64.dll"])
 
         load_error = None
+        architecture_errors = []
+        python_arch = "x64" if ctypes.sizeof(ctypes.c_void_p) == 8 else "x86"
         for candidate in library_candidates:
+            resolved_candidate = os.path.abspath(candidate) if os.path.isfile(candidate) else candidate
+            if os.path.isfile(resolved_candidate):
+                dll_arch = get_windows_pe_architecture(resolved_candidate)
+                if dll_arch and dll_arch != python_arch:
+                    architecture_errors.append(f"{candidate} is {dll_arch}, Python is {python_arch}")
+                    continue
             try:
-                self.library = ctypes.WinDLL(candidate)
+                self.library = ctypes.WinDLL(resolved_candidate)
                 break
             except Exception as exc:
                 load_error = exc
 
         if self.library is None:
+            architecture_hint = ""
+            if architecture_errors:
+                architecture_hint = " Architecture mismatch: " + "; ".join(architecture_errors) + "."
             raise RuntimeError(
                 "MR-MC240N API library could not be loaded. "
-                "Place mc2xxstd.dll or mc2xxstd_x64.dll beside the program or in PATH."
+                "Use mc2xxstd_x64.dll with 64-bit Python or mc2xxstd.dll with 32-bit Python."
+                + architecture_hint
             ) from load_error
 
         self._bind_api("sscOpen", [ctypes.c_int])
@@ -523,6 +556,8 @@ class MrMc240nPositionController:
         return speed, acceleration_ms, deceleration_ms
 
     def set_servo_on(self, enabled):
+        if enabled:
+            self.read_feedback_position_counts()
         bit_value = self.SSC_BIT_ON if enabled else self.SSC_BIT_OFF
         self._call_api(
             "sscSetCommandBitSignalEx",
@@ -566,6 +601,7 @@ class MrMc240nPositionController:
         }
 
     def start_jog(self, direction, speed, acceleration_ms, deceleration_ms):
+        self.read_feedback_position_counts()
         speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
             speed, acceleration_ms, deceleration_ms
         )
@@ -580,7 +616,7 @@ class MrMc240nPositionController:
             speed,
             acceleration_ms,
             deceleration_ms,
-            direction,
+            bytes([direction]),
         )
         self._jog_active = True
 
@@ -598,6 +634,7 @@ class MrMc240nPositionController:
         self._jog_active = False
 
     def move_relative(self, distance_counts, speed, acceleration_ms, deceleration_ms):
+        self.read_feedback_position_counts()
         distance_counts = int(distance_counts)
         if not -2_147_483_647 <= distance_counts <= 2_147_483_647:
             raise ValueError("Relative distance exceeds the signed 32-bit command range.")
@@ -619,6 +656,7 @@ class MrMc240nPositionController:
         )
 
     def start_home_return(self):
+        self.read_feedback_position_counts()
         self._call_api(
             "sscHomeReturnStart",
             self.board_id,
